@@ -1,0 +1,378 @@
+---
+title: "kkd#2-1-2 MCAOarticle, analysis using only-flox samples"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+## Gene name: HUMAN to Mouse pattern
+HUtoMSpattern <- function(x) { paste0(stringr::str_sub(x,1,1), tolower(stringr::str_sub(x,2,-1))) }
+
+# Parameters
+SampleIDsForDataLoading <- c("N.flox","MO1h.flox","MO3h.flox")
+SampleIDs <- c("Naive","MCAO1h","MCAO3h")
+nSample <- length(SampleIDs)
+```
+
+
+# 1. Remove Doublet
+R package: DoubletFinder
+https://github.com/chris-mcginnis-ucsf/DoubletFinder
+
+## 1-1. Functions for Doublet Finder
+```{r}
+# Pre-process Seurat objects
+Preprocess <- function(sample, nFeature.min, nFeature.max, percent.mt.max, dims.max, resolution) {
+  sample2 <- subset(x = sample, cells = names(sample$nFeature_RNA)[which(sample$nFeature_RNA > nFeature.min)])
+  sample2 <- subset(x = sample2, cells = names(sample$nFeature_RNA)[which(sample$nFeature_RNA < nFeature.max)])
+  sample2 <- subset(x = sample2, cells = names(sample$percent.mt)[which(sample$percent.mt < percent.mt.max)])
+  sample2 <- FindVariableFeatures(object = sample2, selection.method = "vst", nfeatures = 2000)
+  sample2 <- ScaleData(object = sample2)
+  sample2 <- RunPCA(sample2)
+  sample2 <- FindNeighbors(object = sample2, dims = 1:dims.max)
+  sample2 <- FindClusters(object = sample2, resolution = resolution)
+  sample2 <- RunUMAP(sample2, dims = 1:dims.max)
+  return(sample2)
+}
+
+# Find Doublet
+FindDoublet <- function(sample, dims.max, AssumeDoublet, pN, pK) {
+  ## Homotypic Doublet Proportion Estimate
+  homotypic.prop <- modelHomotypic(sample@active.ident) ## ex: annotations <- seu_test@meta.data$ClusteringResults
+  nExp_poi <- round(AssumeDoublet*length(sample@active.ident))  
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  
+  ## Run DoubletFinder with varying classification stringencies
+  sample2 <- doubletFinder_v3(sample, PCs = 1:dims.max, pN = pN, pK = pK, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+  return(sample2)
+}
+
+# Remove doublet
+RemoveDoublet <- function(sample) {
+  DF.position <- grep("DF.classifications",colnames(sample@meta.data))
+  if (length(DF.position) == 1) {
+    DF.classifications <- sample@meta.data[DF.position]
+    Singlet.ID <- rownames(DF.classifications)[which(DF.classifications=="Singlet")]
+    sample2 <- subset(sample, cells=Singlet.ID)
+    return(sample2)
+  } 
+  else { (print("ERROR: multiple DF.classifications")) }
+}
+```
+
+## 1-2. Read RAW data
+```{r}
+# Make "each sample directory name" same as "SampleIDs"
+data.list <- list()
+for (i in 1:nSample) {
+  data.list[i] <- Read10X(data.dir = paste("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOflox_082319/MCAOflox_out", SampleIDsForDataLoading[i], "filtered_feature_bc_matrix", sep="/"))
+  names(data.list)[i] <- SampleIDs[i]
+}
+print("Before equalize cell numbers")
+unlist(lapply(data.list, ncol))
+```
+
+## 1-3. Remove Doublet
+
+### 1-3-1 Pre-process Seurat object
+```{r}
+# Create and Normalize Seurat.object
+Seurat.list <- data.list %>% lapply(CreateSeuratObject, min.cells = 3, min.features = 200) %>% lapply(NormalizeData)
+
+# Check MT percentage and nFeature
+nFeature.data <- data.frame(Sample=NA,Data=NA,stringsAsFactors = F)
+perMT.data <- data.frame(Sample=NA,Data=NA,stringsAsFactors = F)
+for (i in seq_along(Seurat.list)) {
+  Seurat.list[[i]][["percent.mt"]] <- PercentageFeatureSet(object = Seurat.list[[i]], pattern = "^mt-")
+  Seurat.list[[i]]$stim <- SampleIDs[i]
+  nFeature.data <- rbind(nFeature.data, data.frame(Sample=names(Seurat.list)[[i]], Data=Seurat.list[[i]]$nFeature_RNA))
+  perMT.data <- rbind(perMT.data, data.frame(Sample=names(Seurat.list)[[i]], Data=Seurat.list[[i]]$percent.mt))
+}
+nFeature.data <- na.omit(nFeature.data)
+perMT.data <- na.omit(perMT.data)
+
+# Check
+ggplot(data=nFeature.data, aes(x=Sample,y=Data)) + geom_jitter(size=0.1) + scale_x_discrete(limit=SampleIDs)
+ggplot(data=perMT.data, aes(x=Sample,y=Data)) + geom_jitter(size=0.1) + ylim(0,30)
+
+# Pre-process Seurat objects
+Seurat.list <- lapply(Seurat.list, Preprocess, nFeature.min=200, nFeature.max=6000, percent.mt.max=10, dims.max=15, resolution=0.5)
+Elbow.list <- lapply(Seurat.list, ElbowPlot)
+for (i in seq_along(Elbow.list)) { plot(Elbow.list[[i]]) }
+```
+
+### 1-3-2 Find and Remove doublet
+```{r}
+## Assuming 7.6% doublet formation rate - 10X genomics, loading 16,000 cells
+Seurat.list <- lapply(Seurat.list, FindDoublet, dims.max=15, AssumeDoublet=0.076, pN=0.25, pK=0.01)
+
+# Percentage of detected doublets 
+for (i in seq_along(Seurat.list)) {
+  DF.position <- grep("DF.classifications", colnames(Seurat.list[[i]]@meta.data))
+  print(names(Seurat.list)[i])
+  print(length(which(Seurat.list[[i]]@meta.data[DF.position]=="Doublet"))*100/ncol(Seurat.list[[i]]))
+}
+# Visualization of doublets
+for (i in seq_along(Seurat.list)) {
+  DF.position <- grep("DF.classifications", colnames(Seurat.list[[i]]@meta.data))
+  names(Seurat.list[[i]]@meta.data)[DF.position] <- "DF.classifications"
+  plot(DimPlot(object = Seurat.list[[i]], reduction = "umap", label=T, label.size=5, group.by = "DF.classifications"))
+}
+
+# Remove doublets
+Seurat.list2 <- lapply(Seurat.list, RemoveDoublet)
+```
+
+
+# 2. Equalize cell number
+```{r}
+# Equalize the cell number among each sample
+# **Choose the first 7156 cells in this case**
+print("Before equalize cell numbers")
+unlist(lapply(Seurat.list2, ncol))
+
+nMin <- min(unlist(lapply(Seurat.list2, ncol)))
+Seurat.list2 <- lapply(Seurat.list2, function(x) { x[,1:nMin] }) # Choose the cells in first "nMin" column 
+print("After equalize cell numbers")
+unlist(lapply(Seurat.list2, ncol))
+```
+
+# 3. Merge Seurat object and Clusterize the data
+```{r}
+# Merge all Seurat object
+MCAOflox <- merge(x=Seurat.list2[[1]], y=Seurat.list2[-1])
+# [Identification of highly variable features (feature selection)]
+MCAOflox <- FindVariableFeatures(object = MCAOflox, selection.method = "vst", nfeatures = 2000)
+
+# [Scaling the data] =Z-score??
+all.genes <- rownames(x = MCAOflox)
+MCAOflox <- ScaleData(object = MCAOflox, features=all.genes)
+rm(all.genes)
+
+# [Perform linear dimensional reduction]
+MCAOflox <- RunPCA(object = MCAOflox, features = VariableFeatures(object = MCAOflox))
+
+# Examine and visualize PCA results a few different ways
+DimPlot(object = MCAOflox, reduction = "pca")
+ElbowPlot(object = MCAOflox)
+
+# [Cluster the cells]
+MCAOflox <- FindNeighbors(object = MCAOflox, dims = 1:20)
+MCAOflox <- FindClusters(object = MCAOflox, resolution = 0.5)
+MCAOflox <- RunUMAP(object = MCAOflox, dims = 1:20)
+```
+
+# 4. Find Markers and name cell types
+```{r}
+if (0) {
+# [Finding differentially expressed features (cluster biomarkers)]
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+library(plyr)
+library(dplyr)
+library(Matrix)
+
+MCAOflox.markers <- FindAllMarkers(object = MCAOflox, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+MCAOflox.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+write.csv(MCAOflox.markers, file="MCAOflox_markers_112419.csv")
+}
+```
+
+**dims=20**  **resolution=0.5**
+```{r}
+# Name cell types
+new.cluster.ids <- c("MG1","MG4","MG5","MG7","Neut","MG6","MG8","Tcell","Ly6ChiMo","MG2","MG3","MP-DC","Bcell","resMo","NK","Prolif","ILC")
+names(x = new.cluster.ids) <- levels(x = MCAOflox)
+MCAOflox <- RenameIdents(object = MCAOflox, new.cluster.ids)
+rm(new.cluster.ids)
+
+# Change the order of cell types
+Idents(object = MCAOflox) <- factor(x = Idents(object = MCAOflox), levels = c("MG1","MG2","MG3","MG4","MG5","MG6","MG7","MG8","MP-DC","resMo","Ly6ChiMo","Neut","Tcell","NK","ILC","Bcell","Prolif"))
+
+# Save into metadata
+MCAOflox$celltype <- MCAOflox@active.ident
+```
+
+MCAOflox_celltype
+Cluster	Cell_type	Marker_gene
+0	MG1	Cx3cr1, Tmem119
+1	MG4	Cx3cr1, Tmem119
+2	MG5	Cx3cr1, Tmem119
+3	MG7	Cx3cr1, Tmem119
+4	Neut	S100a8, Mmp8, Mmp9, Ly6g
+5	MG6	Cx3cr1, Tmem119
+6	MG8	Cx3cr1, Tmem119
+7	Tcell	Cd3g, Cd3d
+8	Ly6ChiMo	Ly6c2, Ccr2
+9	MG2	Cx3cr1, Tmem119
+10	MG3	Cx3cr1, Tmem119
+11	MP-DC	Ccr2, H2-Ab1, Mrc1, Flt3
+12	Bcell	Igkc, Cd79a, Cd79b
+13	resMo	Fcgr4, Ear2
+14	NK	Gzma, Gzmb, Prf1, Klrk1
+15	Prolif	Mki67
+16	ILC	Il1rl1, Kit, Il7r
+
+
+```{r}
+MCAOflox$roughCelltype <- replace(as.character(MCAOflox$celltype), grep("MG", MCAOflox$celltype), "Microglia")
+Idents(MCAOflox) <- MCAOflox$roughCelltype
+```
+
+
+# 5. Visualize UMAP data
+```{r}
+Idents(MCAOflox) <- MCAOflox$roughCelltype
+order <- c("Microglia","MP-DC","Ly6ChiMo","resMo","Neut","Tcell","Bcell","NK","ILC","Prolif")
+DimPlot(object = MCAOflox, reduction = "umap",  order=rev(order), label=F, label.size=7) 
+```
+
+Grouped by time points
+```{r}
+DimPlot(object = MCAOflox, reduction = "umap",  order=c("Naive","MCAO1h","MCAO3h"), label=F, label.size=7, group.by = "stim") 
+```
+
+
+```{r}
+# Each gene expression
+FeaturePlot(object = MCAOflox, features = c("Runx1"), cols = c("lightgrey", "red"), max.cutoff = "q80")
+```
+
+
+# 6. Save or load Seurat object
+```{r}
+saveRDS(MCAOflox, "/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOflox/MCAOflox_012120.rds")
+```
+
+```{r}
+MCAOflox <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOflox/MCAOflox_012120.rds")
+```
+
+
+# 7. Reclustering MP-DC
+```{r}
+MPDCflox <- subset(MCAOflox, idents="MP-DC")
+MPDCflox <- FindVariableFeatures(object = MPDCflox, selection.method = "vst", nfeatures = 2000)
+MPDCflox <- RunPCA(object = MPDCflox, features = VariableFeatures(object = MPDCflox))
+ElbowPlot(object = MPDCflox)
+MPDCflox <- FindNeighbors(object = MPDCflox, dims = 1:10)
+MPDCflox <- FindClusters(object = MPDCflox, resolution = 0.1)
+MPDCflox <- RunUMAP(MPDCflox, reduction = "pca", dims = 1:10)
+DimPlot(MPDCflox, reduction = "umap", label=T, label.size =5)
+FeaturePlot(object = MPDCflox, features = c("Mrc1","Itgax","Flt3"), cols = c("lightgrey", "red"))
+
+# Mrc1_posi cells: idents=c("0") → MP
+# Itgax_Flt3_posi cells: idents=c("1") → DC
+```
+
+
+# 8. Re-define cells
+・MP-DC -> separate into MP and DC
+・resMo -> Ly6CloMo
+
+```{r}
+MPDCflox_Mrc1_posi_ID <- WhichCells(MPDCflox, idents = "0")
+MPDCflox_Itgax_Flt3_posi_ID <- WhichCells(MPDCflox, idents = c("1"))
+
+MCAOflox$final.celltype = MCAOflox$roughCelltype %>% replace(whichall(MPDCflox_Mrc1_posi_ID, names(MCAOflox$roughCelltype)), "MP")
+MCAOflox$final.celltype = MCAOflox$final.celltype %>% replace(whichall(MPDCflox_Itgax_Flt3_posi_ID, names(MCAOflox$roughCelltype)), "DC")
+MCAOflox$final.celltype = MCAOflox$final.celltype %>% replace(which(MCAOflox$final.celltype=="resMo"), "Ly6CloMo")
+MCAOflox$final.celltype %>% unique
+
+Idents(MCAOflox) <- MCAOflox$final.celltype
+```
+
+```{r}
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6CloMo","Neut","Tcell","Bcell","NK","ILC","Prolif")
+DimPlot(object = MCAOflox, reduction = "umap", label=T, label.size=3, order=rev(order)) 
+```
+
+save data
+```{r}
+saveRDS(MCAOflox, file="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/MCAOflox_021520.rds")
+```
+
+
+
+# 9. DEGs in each cell type
+Prepare $time_rCelltype and vector:rCelltypes
+```{r}
+if (isallsame(names(MCAOflox$stim), names(MCAOflox$final.celltype))) {
+  MCAOflox$time_fCelltype <- paste(MCAOflox$stim, MCAOflox$final.celltype, sep = "_")
+}
+fCelltypes <- c("Microglia","MP","DC","Ly6ChiMo","Ly6CloMo","Neut","Tcell","Bcell","NK","ILC","Prolif")
+```
+
+DEGs in each cell type
+```{r}
+Idents(MCAOflox) <- MCAOflox$time_fCelltype
+# DEGs of 1H
+DEG_1HvsN.list <- vector("list", length=length(fCelltypes))
+for (i in seq_along(fCelltypes)) {
+  DEG_1HvsN.list[[i]] <- FindMarkers(MCAOflox, ident.1 = paste("MCAO1h",fCelltypes[i],sep = "_"), ident.2 = paste("Naive",fCelltypes[i],sep = "_"))
+  names(DEG_1HvsN.list)[i] <- fCelltypes[i]
+}
+# DEGs of 3H
+DEG_3HvsN.list <- vector("list", length=length(fCelltypes))
+for (i in seq_along(fCelltypes)) {
+  DEG_3HvsN.list[[i]] <- FindMarkers(MCAOflox, ident.1 = paste("MCAO3h",fCelltypes[i],sep = "_"), ident.2 = paste("Naive",fCelltypes[i],sep = "_"))
+  names(DEG_3HvsN.list)[i] <- fCelltypes[i]
+}
+Idents(MCAOflox) <- MCAOflox$final.celltype
+```
+
+
+# 10. Visualization of DEGs
+**MCAO1h**
+```{r}
+DEGsVis <- data.frame(Sample = NA, Value = NA, stringsAsFactors = F)
+for (i in seq_along(fCelltypes)) {
+  selectedDEGs <- DEG_1HvsN.list[[i]] %>% filter(p_val_adj < 0.05)
+  data <-  data.frame(Sample=rep(names(DEG_1HvsN.list)[i], length=nrow(selectedDEGs)), Value=selectedDEGs$avg_logFC)
+  DEGsVis <- rbind(DEGsVis, data)
+  rm(list=c("data", "selectedDEGs"))
+}
+DEGsVis <- na.omit(DEGsVis)
+
+x_order <- DEG_1HvsN.list %>% lapply(function(x){ nrow(filter(x, p_val_adj < 0.05)) }) %>% unlist() %>% sort(decreasing=T) %>% names()
+ggplot(DEGsVis, aes(x=Sample, y=Value)) + geom_jitter() + scale_x_discrete(limits=x_order) + theme_classic() + theme(axis.title.x = element_blank(), axis.text.x = element_text(size=20, angle=45, hjust = 1))
+```
+
+**MCAO3h**
+```{r}
+DEGsVis <- data.frame(Sample = NA, Value = NA, stringsAsFactors = F)
+for (i in seq_along(fCelltypes)) {
+  selectedDEGs <- DEG_3HvsN.list[[i]] %>% filter(p_val_adj < 0.05)
+  data <-  data.frame(Sample=rep(names(DEG_3HvsN.list)[i], length=nrow(selectedDEGs)), Value=selectedDEGs$avg_logFC)
+  DEGsVis <- rbind(DEGsVis, data)
+  rm(list=c("data", "selectedDEGs"))
+}
+DEGsVis <- na.omit(DEGsVis)
+
+x_order <- DEG_3HvsN.list %>% lapply(function(x){ nrow(filter(x, p_val_adj < 0.05)) }) %>% unlist() %>% sort(decreasing=T) %>% names()
+ggplot(DEGsVis, aes(x=Sample, y=Value)) + geom_jitter() + scale_x_discrete(limits=x_order) + theme_classic() + theme(axis.title.x = element_blank(), axis.text.x = element_text(size=20, angle=45, hjust = 1))
+```
