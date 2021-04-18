@@ -1,0 +1,984 @@
+---
+title: "kkd2-2 MCAOarticle, analysis using both flox and creflox samples"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+library(VennDiagram)
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+# Parameters
+SampleIDs <- c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox")
+nSample <- length(SampleIDs)
+```
+
+
+# 1. Load RAW data
+```{r}
+# Make "each sample directory name" same as "SampleIDs"
+data.list <- list()
+for (i in 1:nSample) {
+  data.list[i] <- Read10X(data.dir = paste("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/MCAOall_out", SampleIDs[i], "filtered_feature_bc_matrix", sep="/"))
+  names(data.list)[i] <- SampleIDs[i]
+}
+print("Before equalize cell numbers")
+unlist(lapply(data.list, ncol))
+```
+
+
+# 2. Remove Doublet
+R package: DoubletFinder
+https://github.com/chris-mcginnis-ucsf/DoubletFinder
+
+Prepare Functions for doublet removal
+```{r}
+# Pre-process Seurat objects
+Preprocess <- function(sample, nFeature.min, nFeature.max, percent.mt.max, dims.max, resolution) {
+  sample2 <- subset(x = sample, cells = names(sample$nFeature_RNA)[which(sample$nFeature_RNA > nFeature.min)])
+  sample2 <- subset(x = sample2, cells = names(sample$nFeature_RNA)[which(sample$nFeature_RNA < nFeature.max)])
+  sample2 <- subset(x = sample2, cells = names(sample$percent.mt)[which(sample$percent.mt < percent.mt.max)])
+  sample2 <- FindVariableFeatures(object = sample2, selection.method = "vst", nfeatures = 2000)
+  sample2 <- ScaleData(object = sample2)
+  sample2 <- RunPCA(sample2)
+  sample2 <- FindNeighbors(object = sample2, dims = 1:dims.max)
+  sample2 <- FindClusters(object = sample2, resolution = resolution)
+  sample2 <- RunUMAP(sample2, dims = 1:dims.max)
+  return(sample2)
+}
+
+# Find Doublet
+FindDoublet <- function(sample, dims.max, AssumeDoublet, pN, pK) {
+  ## Homotypic Doublet Proportion Estimate
+  homotypic.prop <- modelHomotypic(sample@active.ident) ## ex: annotations <- seu_test@meta.data$ClusteringResults
+  nExp_poi <- round(AssumeDoublet*length(sample@active.ident))  
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  
+  ## Run DoubletFinder with varying classification stringencies
+  sample2 <- doubletFinder_v3(sample, PCs = 1:dims.max, pN = pN, pK = pK, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+  return(sample2)
+}
+
+# Remove doublet
+RemoveDoublet <- function(sample) {
+  DF.position <- grep("DF.classifications",colnames(sample@meta.data))
+  if (length(DF.position) == 1) {
+    DF.classifications <- sample@meta.data[DF.position]
+    Singlet.ID <- rownames(DF.classifications)[which(DF.classifications=="Singlet")]
+    sample2 <- subset(sample, cells=Singlet.ID)
+    return(sample2)
+  } 
+  else { (print("ERROR: multiple DF.classifications")) }
+}
+```
+
+Remove Doublet
+## DR-1 Pre-process Seurat object
+```{r}
+# Create and Normalize Seurat.object
+Seurat.list <- data.list %>% lapply(CreateSeuratObject, min.cells = 3, min.features = 200) %>% lapply(NormalizeData)
+
+# Check MT percentage and nFeature
+nFeature.data <- data.frame(Sample=NA,Data=NA,stringsAsFactors = F)
+perMT.data <- data.frame(Sample=NA,Data=NA,stringsAsFactors = F)
+for (i in seq_along(Seurat.list)) {
+  Seurat.list[[i]][["percent.mt"]] <- PercentageFeatureSet(object = Seurat.list[[i]], pattern = "^mt-")
+  Seurat.list[[i]]$stim <- SampleIDs[i]
+  nFeature.data <- rbind(nFeature.data, data.frame(Sample=names(Seurat.list)[[i]], Data=Seurat.list[[i]]$nFeature_RNA))
+  perMT.data <- rbind(perMT.data, data.frame(Sample=names(Seurat.list)[[i]], Data=Seurat.list[[i]]$percent.mt))
+}
+nFeature.data <- na.omit(nFeature.data)
+perMT.data <- na.omit(perMT.data)
+
+# Check
+ggplot(data=nFeature.data, aes(x=Sample,y=Data)) + geom_jitter(size=0.1) + scale_x_discrete(limit=SampleIDs)
+ggplot(data=perMT.data, aes(x=Sample,y=Data)) + geom_jitter(size=0.1) + ylim(0,30)
+
+# Pre-process Seurat objects
+Seurat.list <- lapply(Seurat.list, Preprocess, nFeature.min=200, nFeature.max=6000, percent.mt.max=10, dims.max=15, resolution=0.5)
+Elbow.list <- lapply(Seurat.list, ElbowPlot)
+for (i in seq_along(Elbow.list)) { plot(Elbow.list[[i]]) }
+```
+
+## DR-2 Find and Remove doublet
+```{r}
+## Assuming 7.6% doublet formation rate - 10X genomics, loading 16,000 cells
+Seurat.list <- lapply(Seurat.list, FindDoublet, dims.max=15, AssumeDoublet=0.076, pN=0.25, pK=0.01)
+
+# Percentage of detected doublets 
+for (i in seq_along(Seurat.list)) {
+  DF.position <- grep("DF.classifications", colnames(Seurat.list[[i]]@meta.data))
+  print(names(Seurat.list)[i])
+  print(length(which(Seurat.list[[i]]@meta.data[DF.position]=="Doublet"))*100/ncol(Seurat.list[[i]]))
+}
+# Visualization of doublets
+for (i in seq_along(Seurat.list)) {
+  DF.position <- grep("DF.classifications", colnames(Seurat.list[[i]]@meta.data))
+  names(Seurat.list[[i]]@meta.data)[DF.position] <- "DF.classifications"
+  plot(DimPlot(object = Seurat.list[[i]], reduction = "umap", label=T, label.size=5, group.by = "DF.classifications"))
+}
+
+# Remove doublets
+Seurat.list2 <- lapply(Seurat.list, RemoveDoublet)
+```
+
+
+# 3. Equalize cell number
+```{r}
+# Equalize the cell number among each sample
+# **Choose the first 7156 cells in this case**
+print("Before equalize cell numbers")
+unlist(lapply(Seurat.list2, ncol))
+
+nMin <- min(unlist(lapply(Seurat.list2, ncol)))
+Seurat.list2 <- lapply(Seurat.list2, function(x) { x[,1:nMin] }) # Choose the cells in first "nMin" column 
+print("After equalize cell numbers")
+unlist(lapply(Seurat.list2, ncol))
+```
+
+
+# 4. Merge Seurat object and Clusterize the data
+```{r}
+# Merge all Seurat object
+MCAOall <- merge(x=Seurat.list2[[1]], y=Seurat.list2[-1])
+# [Identification of highly variable features (feature selection)]
+MCAOall <- FindVariableFeatures(object = MCAOall, selection.method = "vst", nfeatures = 2000)
+```
+
+```{r}
+# Select meta.data
+MCAOall@meta.data = MCAOall@meta.data %>% select(-pANN_0.25_0.01_447,-DF.classifications,-pANN_0.25_0.01_452,-pANN_0.25_0.01_548,-pANN_0.25_0.01_663,-pANN_0.25_0.01_483,-pANN_0.25_0.01_713)
+
+# [Scaling the data] =Z-score??
+all.genes <- rownames(x = MCAOall)
+MCAOall <- ScaleData(object = MCAOall, features=all.genes)
+rm(all.genes)
+
+# [Perform linear dimensional reduction]
+MCAOall <- RunPCA(object = MCAOall, features = VariableFeatures(object = MCAOall))
+
+# Examine and visualize PCA results a few different ways
+DimPlot(object = MCAOall, reduction = "pca")
+ElbowPlot(object = MCAOall)
+
+# [Cluster the cells]
+MCAOall <- FindNeighbors(object = MCAOall, dims = 1:20)
+MCAOall <- FindClusters(object = MCAOall, resolution = 0.5)
+MCAOall <- RunUMAP(object = MCAOall, dims = 1:20)
+```
+
+
+# 5. Find Markers and name cell types
+```{r}
+if (0) {
+# [Finding differentially expressed features (cluster biomarkers)]
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+library(plyr)
+library(dplyr)
+library(Matrix)
+
+MCAOall.markers <- FindAllMarkers(object = MCAOall, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+MCAOall.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+write.csv(MCAOall.markers, file="MCAO.all.markers.csv")
+}
+```
+
+Cluster	Cell_type	Marker_gene
+0	MG1	Cx3cr1, Tmem119
+1	MG5	Cx3cr1, Tmem119
+2	MG8	Cx3cr1, Tmem119
+3	MG6	Cx3cr1, Tmem119
+4	MG7	Cx3cr1, Tmem119
+5	Neut2	S100a8, Mmp8, Mmp9, Ly6g
+6	MG4	Cx3cr1, Tmem119
+7	Ly6ChiMo	Ccr2, Ly6c2
+8	Tcell	Cd3d, Cd3g
+9	Bcell	Igkc, Cd79a, Cd79b
+10	MP-DC	Ccr2, H2-Ab1, Mrc1, Flt3
+11	resMo	Fcgr4, Ear2
+12	Neut1	S100a8, Mmp8, Mmp9, Ly6g
+13	NK	Gzma, Gzmb, Prf1, Klrk1
+14	MG2	Cx3cr1, Tmem119
+15	Prolif	Mki67, Ccr2, Ly6c2
+16	MG3	Cx3cr1, Tmem119
+17	Others	Neut?
+
+**dims=20**  **resolution=0.6**
+```{r}
+# Name cell types
+new.cluster.ids <- c("MG1","MG5","MG8","MG6","MG7","Neut2","MG4","Ly6ChiMo","Tcell","Bcell","MP-DC","resMo","Neut1","NK","MG2","Prolif","MG3","Others")
+names(x = new.cluster.ids) <- levels(x = MCAOall)
+MCAOall <- RenameIdents(object = MCAOall, new.cluster.ids)
+rm(new.cluster.ids)
+
+# Change the order of cell types
+Idents(object = MCAOall) <- factor(x = Idents(object = MCAOall), levels = c("MG1","MG2","MG3","MG4","MG5","MG6","MG7","MG8","Neut1","Neut2","Ly6ChiMo","resMo","MP-DC","Tcell","NK","Bcell","Prolif","Others"))
+```
+
+```{r}
+DimPlot(MCAOall, reduction = "umap", label=T, label.size =5)
+```
+
+# 6. Add metadata
+```{r}
+MCAOall$orig.celltype <- MCAOall@active.ident
+MCAOall$timepoint <- MCAOall$stim %>% replace(grep("N.", MCAOall$stim),"0h") %>% replace(grep("MO1h.", MCAOall$stim),"1h") %>% replace(grep("MO3h.", MCAOall$stim),"3h")
+MCAOall$strain <- MCAOall$stim %>% replace(c(grep("N.flox",.),grep("h.flox", .)),"flox") %>% replace(grep(".LMcreflox",.), "LMcreflox")
+```
+
+```{r}
+saveRDS(MCAOall, "/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819.rds")
+```
+
+
+# 7. Reçlustering proliferating cells
+```{r}
+Prolif <- subset(MCAOall, idents="Prolif")
+Prolif <- FindVariableFeatures(object = Prolif, selection.method = "vst", nfeatures = 2000)
+Prolif <- RunPCA(object = Prolif, features = VariableFeatures(object = Prolif))
+ElbowPlot(object = Prolif)
+Prolif <- FindNeighbors(object = Prolif, dims = 1:10)
+Prolif <- FindClusters(object = Prolif, resolution = 0.1)
+Prolif <- RunUMAP(Prolif, reduction = "pca", dims = 1:10)
+DimPlot(Prolif, reduction = "umap", label=T, label.size =5)
+FeaturePlot(object = Prolif, features = c("Ly6c2","Itgam","Cd3d"), cols = c("lightgrey", "red"))
+
+# Itgam_Ly6c2_posi cells: idents=c("0","1")
+# Cd3_posi cells: idents=c("3")
+```
+
+# 8. Reclustering MP-DC
+```{r}
+MPDC <- subset(MCAOall, idents="MP-DC")
+MPDC <- FindVariableFeatures(object = MPDC, selection.method = "vst", nfeatures = 2000)
+MPDC <- RunPCA(object = MPDC, features = VariableFeatures(object = MPDC))
+ElbowPlot(object = MPDC)
+MPDC <- FindNeighbors(object = MPDC, dims = 1:10)
+MPDC <- FindClusters(object = MPDC, resolution = 0.1)
+MPDC <- RunUMAP(MPDC, reduction = "pca", dims = 1:10)
+DimPlot(MPDC, reduction = "umap", label=T, label.size =5)
+FeaturePlot(object = MPDC, features = c("Mrc1","Itgax","Flt3"), cols = c("lightgrey", "red"))
+
+# Mrc1_posi cells: idents=c("0") → MP
+# Itgax_Flt3_posi cells: idents=c("1","2") → DC  ("2": Itgam_nega cDC?)
+```
+
+# 9. Re-define cells
+Prolif_Cd11b(Itgam)+ Ly6C(Ly6c2)+ : Ly6ChiMo_prolif
+Prolif_Cd3+ : Tcell_prolif
+
+```{r}
+Prolif_Itgam_Ly6c2_posi_ID <- WhichCells(Prolif, idents = c("0","1"))
+Prolif_Cd3_posi_ID <- WhichCells(Prolif, idents = "3")
+
+MPDC_Mrc1_posi_ID <- WhichCells(MPDC, idents = "0")
+MODC_Itgax_Flt3_posi_ID <- WhichCells(MPDC, idents = c("1","2"))
+
+MCAOall$final.celltype = as.character(MCAOall$orig.celltype) %>% replace(grep("^Prolif", MCAOall$orig.celltype), "Others_prolif")
+MCAOall$final.celltype = MCAOall$final.celltype %>% replace(whichall(Prolif_Itgam_Ly6c2_posi_ID, names(MCAOall$orig.celltype)), "Ly6ChiMo_prolif")
+MCAOall$final.celltype = MCAOall$final.celltype %>% replace(whichall(Prolif_Cd3_posi_ID, names(MCAOall$orig.celltype)), "Tcell_prolif")
+MCAOall$final.celltype = MCAOall$final.celltype %>% replace(whichall(MPDC_Mrc1_posi_ID, names(MCAOall$orig.celltype)), "MP")
+MCAOall$final.celltype = MCAOall$final.celltype %>% replace(whichall(MODC_Itgax_Flt3_posi_ID, names(MCAOall$orig.celltype)), "DC")
+MCAOall$final.celltype = MCAOall$final.celltype %>% replace(grep("^MG", MCAOall$orig.celltype), "Microglia")
+MCAOall$final.celltype = MCAOall$final.celltype %>% replace(grep("^Neut", MCAOall$orig.celltype), "Neut")
+MCAOall$final.celltype %>% unique
+
+Idents(MCAOall) <- MCAOall$final.celltype
+```
+
+```{r}
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Tcell_prolif","Bcell","NK","Others","Others_prolif")
+DimPlot(object = MCAOall, reduction = "umap",  order=rev(order), label=T, label.size=3) 
+```
+
+```{r}
+saveRDS(MCAOall, "/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+```
+
+```{r}
+MCAOall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+```
+
+
+
+
+
+# 10. Find Markers of "final.celltype"
+```{r}
+# [Finding differentially expressed features (cluster biomarkers)]
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+library(plyr)
+library(dplyr)
+library(Matrix)
+
+Idents(MCAOall) <- MCAOall$final.celltype
+MCAOall.finalcelltype.markers <- FindAllMarkers(object = MCAOall, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+MCAOall.finalcelltype.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+write.csv(MCAOall.finalcelltype.markers, file="/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall.finalcelltype.markers.csv")
+```
+
+# 11. Visualize Markers of "final.celltype"
+
+Top 5 markers
+```{r}
+MCAOall.finalcelltype.markers <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall.finalcelltype.markers.csv", header = T, stringsAsFactors = F)
+MCAOall.finalcelltype.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_logFC)
+```
+
+
+Visualization
+```{r}
+Markers <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_markers_forPlot3.csv", header=T, stringsAsFactors = F)
+
+features <- c()
+for(i in seq_along(colnames(Markers))) {
+  features <- c(features, Markers[,i])
+}
+features <- unique(features[-which(features=="")])
+
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Bcell","NK")
+
+DotPlot(
+  MCAOall,
+  assay = NULL,
+  features = features,
+  cols = c("lightgrey", "blue"),
+  col.min = -2.5,
+  col.max = 2.5,
+  dot.min = 0,
+  dot.scale = 6,
+  group.by = NULL,
+  split.by = NULL,
+  scale.by = "radius",
+  scale.min = NA,
+  scale.max = NA
+) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + scale_y_discrete(limits=order) + coord_flip()
+```
+
+# 12. Identify Cd300a-knocked down celltypes by Lyz2-cre = causal celltype for the MCAO phenotype
+
+Detection of DEGs for each Celltype: KOvsWT
+```{r}
+if (isallsame(names(MCAOall$strain), names(MCAOall$final.celltype))) {
+  MCAOall$strain_final.celltype <- paste(MCAOall$strain, MCAOall$final.celltype, sep="_")
+} else { print("vector orders are not same") } 
+  
+Idents(MCAOall) <- MCAOall$strain_final.celltype
+MCAOall.KOvsWT.list <- vector("list", length=length(unique(MCAOall$final.celltype)))
+
+pb <- progress_bar$new(total = length(unique(MCAOall$final.celltype)), format="[:bar] :percent 経過 :elapsed 終了まで: :eta", clear=TRUE)
+for (i in seq_along(unique(MCAOall$final.celltype))) {
+  pb$tick()
+  
+  ident.1 <- paste0("LMcreflox_", unique(MCAOall$final.celltype)[i])
+  ident.2 <- paste0("flox_", unique(MCAOall$final.celltype)[i])
+  length.1 <- length(which(MCAOall$strain_final.celltype==ident.1))
+  length.2 <- length(which(MCAOall$strain_final.celltype==ident.2))
+  
+  if(length.1>=3 && length.2>=3) {
+    MCAOall.KOvsWT.list[[i]] <- suppressWarnings(FindMarkers(object = MCAOall, ident.1 = ident.1, ident.2 = ident.2, verbose = FALSE))
+    names(MCAOall.KOvsWT.list)[i] <- unique(MCAOall$final.celltype)[i]
+  } else { print(paste0(unique(MCAOall$final.celltype)[i], " didn't have enough cells")) }
+  
+  rm(list=c("ident.1","ident.2","length.1","length.2")) 
+  Sys.sleep(1 / length(unique(MCAOall$final.celltype)))
+}
+rm(pb)
+
+Idents(MCAOall) <- MCAOall$final.celltype
+```
+
+Detect Cd300a-knocked down celltypes by Lyz2-cre
+```{r}
+# Choose list for analysis
+KOvsWT.list <- MCAOall.KOvsWT.list
+
+Cd300a.dif.celltype <- c()
+for (i in 1:length(KOvsWT.list)) {
+  if (is.element("Cd300a", rownames(KOvsWT.list[[i]])) && (KOvsWT.list[[i]]["Cd300a","p_val_adj"]<0.05)) {
+    print(unlist(c(names(KOvsWT.list)[i], KOvsWT.list[[i]]["Cd300a",c("avg_logFC","p_val","p_val_adj")])))
+    Cd300a.dif.celltype <- c(Cd300a.dif.celltype, names(KOvsWT.list)[i])
+  } else {}
+}  
+```
+
+Visualization
+```{r}
+gene <- "Cd300a"
+cell.sample <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Tcell_prolif","Bcell","NK","Others","Others_prolif")
+group <- "strain"
+plot.list <- list()
+
+for (i in seq_along(cell.sample)) {
+plot.list[[i]] <- VlnPlot(MCAOall, idents = cell.sample[i], features = gene, group.by = group, pt.size=0, slot="data", cols=c("white", "grey")) + ylab("Expression") + stat_summary(fun.y = mean, geom='point', size = 10, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank(), axis.text.x=element_blank(), axis.title.y = element_blank(), plot.title=element_text(size=13, face="plain")) + ggtitle(paste(cell.sample[i]))
+
+# + ggtitle(paste(cell.sample[i]))  plot.title=element_text(size=25, face="plain")
+}
+
+do.call(gridExtra::grid.arrange, c(plot.list, nrow = 2))
+rm(list=c("cell.sample","plot.list","gene","group"))
+```
+
+# 13. Combine Ly6ChiMo and Ly6ChiMo_prolif
+```{r}
+MCAOall$final.celltype_forScoring = MCAOall$final.celltype %>% replace(grep("^Ly6ChiMo", MCAOall$final.celltype), "Ly6ChiMo_all")
+MCAOall$final.celltype_forScoring = MCAOall$final.celltype_forScoring %>% replace(grep("^Tcell", MCAOall$final.celltype), "Tcell_all")
+
+MCAOall$final.celltype_forScoring %>% unique
+
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+DimPlot(object = MCAOall, reduction = "umap",  order=rev(levels(Idents(MCAOall))), label=T, label.size=3) 
+```
+
+```{r}
+FeaturePlot(MCAOall, features=c("Lyz2","Itgam"))
+```
+
+
+
+
+# 14. Scoring for cell phenotype
+
+## 14-1. Load gene expression data after several stimulation
+
+### Efferocytosis data
+GSE1197273
+Nature, 563:714, 2019. Efferocytosis induces a novel SLC program to promote glucose uptake and lactate release.
+
+### Other MP activation data: LPS, Ifng, and Ifnb stimulation
+GSE44292
+J Leukoc Biol, 96:167, 2014. Analysis of the transcriptional networks underpinning the activation of murine macrophages by inflammatory mediators.
+
+```{r}
+# Efferocytosis data
+Efferocytosis.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/GSE119273_Phago+AC_bulkRNA/GSE119273_LR73_AC_padj-notNA.csv", header = T, stringsAsFactors = F)
+
+head(Efferocytosis.data, n=10)
+```
+
+```{r}
+# Other MP activation data
+MP_LPS.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/MP-stim_transcriptome/GSE44292_MP/GSE44292_MP-LPS-4h.csv", header=T, stringsAsFactors = F)
+MP_Ifng.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/MP-stim_transcriptome/GSE44292_MP/GSE44292_MP-Ifng-4h.csv", header=T, stringsAsFactors = F)
+MP_Ifnb.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/MP-stim_transcriptome/GSE44292_MP/GSE44292_MP-Ifnb-4h.csv", header=T, stringsAsFactors = F)
+
+head(MP_LPS.data, n=20)
+```
+
+## 14-2. Define UP and DOWN genes based on each data
+```{r}
+p_threshold <- 0.05
+
+# Efferocytosis
+## padj < 0.05, UP in Phago+AC & Exist in MCAO samples
+Effero.UP <- subset(Efferocytosis.data, Efferocytosis.data$padj <= p_threshold & Efferocytosis.data$log2FoldChange > 0)$gene
+Effero.UP <- intersect(rownames(MCAOall), Effero.UP)
+## padj < 0.05, DOWN in Phago+AC & Exist in MCAO samples
+Effero.DOWN <- subset(Efferocytosis.data, Efferocytosis.data$padj <= p_threshold & Efferocytosis.data$log2FoldChange < 0)$gene
+Effero.DOWN <- intersect(rownames(MCAOall), Effero.DOWN)
+
+# LPS
+## padj < 0.05, UP after LPS & Exist in MCAO samples
+LPS.UP <- subset(MP_LPS.data, MP_LPS.data$adj.P.Val <= p_threshold & MP_LPS.data$logFC > 0)$Gene.symbol
+LPS.UP <- intersect(rownames(MCAOall), LPS.UP)
+## padj < 0.05, DOWN after LPS & Exist in MCAO samples
+LPS.DOWN <- subset(MP_LPS.data, MP_LPS.data$adj.P.Val <= p_threshold & MP_LPS.data$logFC < 0)$Gene.symbol
+LPS.DOWN <- intersect(rownames(MCAOall), LPS.DOWN)
+
+# Ifng
+## padj < 0.05, UP after LPS & Exist in MCAO samples
+Ifng.UP <- subset(MP_Ifng.data, MP_Ifng.data$adj.P.Val <= p_threshold & MP_Ifng.data$logFC > 0)$Gene.symbol
+Ifng.UP <- intersect(rownames(MCAOall), Ifng.UP)
+## padj < 0.05, DOWN after Ifng & Exist in MCAO samples
+Ifng.DOWN <- subset(MP_Ifng.data, MP_Ifng.data$adj.P.Val <= p_threshold & MP_Ifng.data$logFC < 0)$Gene.symbol
+Ifng.DOWN <- intersect(rownames(MCAOall), Ifng.DOWN)
+
+# Ifnb
+## padj < 0.05, UP after LPS & Exist in MCAO samples
+Ifnb.UP <- subset(MP_Ifnb.data, MP_Ifnb.data$adj.P.Val <= p_threshold & MP_Ifnb.data$logFC > 0)$Gene.symbol
+Ifnb.UP <- intersect(rownames(MCAOall), Ifnb.UP)
+## padj < 0.05, DOWN after Ifnb & Exist in MCAO samples
+Ifnb.DOWN <- subset(MP_Ifnb.data, MP_Ifnb.data$adj.P.Val <= p_threshold & MP_Ifnb.data$logFC < 0)$Gene.symbol
+Ifnb.DOWN <- intersect(rownames(MCAOall), Ifnb.DOWN)
+```
+
+## 14-3. Prepare scoring function 
+・UP score (UP0.1.int genes): (Calculate (**MCAO1h - mean(Naive)**) for each gene (only *more* than 0) and take sum) / each cell
+・DOWN score (DOWN0.1.int genes): *-*(Calculate (**MCAO1h - mean(Naive)**) for each gene (only *less* than 0) and take sum) / each cell
+・Total score: UP score + DOWN score
+
+```{r}
+Scoring_strains <- function(
+  ObjectForScoring,
+  IdentsForScoring,  # Select from ObjectForScoring@meta.data %>% colnames()
+  CellsForScoring,
+  TimeForScoring,  # Select from ObjectForScoring$timepoint : "0h" or "1h" or "3h"
+  UPgenes,
+  DOWNgenes,
+  Name,
+  ymin,
+  ymax,
+  Strains = c("flox","LMcreflox")
+) {
+  
+  # functions
+  SubstractNaive <- function(x) { x-Naive.mean } 
+  reROWnames <- function(x, replace) { rownames(x)<-replace; x } # Put 2 orders in one line → ;
+  MergeUPDOWN <- function(x) {
+    Out <- vector("list", length=length(x))
+    names(Out) <- names(x)
+    for (i in seq_along(x)) {
+      UPscore <- apply(x[[i]][["UP"]]*(x[[i]][["UP"]]>0), MARGIN = 2, sum) 
+      DOWNscore <- -(apply(x[[i]][["DOWN"]]*(x[[i]][["DOWN"]]<0), MARGIN = 2, sum)) # Take inverse number for DOWNscore 
+      Out[[i]] <- UPscore + DOWNscore
+      rm(list=c("UPscore", "DOWNscore"))
+     }
+    Out2 <- data.frame(Strain=rep("flox", length=length(Out[["flox"]])), Score=Out[["flox"]])
+    Out2 <- rbind(Out2, data.frame(Strain=rep("LMcreflox", length=length(Out[["LMcreflox"]])), Score=Out[["LMcreflox"]]))
+    Out2
+  }
+  
+  # Differential list (Dif.list $ Celltype $ Strain $ UP or DOWN) 
+  Dif.list <- vector("list", length=length(CellsForScoring))
+  names(Dif.list) <- CellsForScoring
+  
+  for (i in seq_along(CellsForScoring)) {  # for each celltype
+    Dif.list[[i]] <- vector("list",length=2)
+    names(Dif.list[[i]]) <- Strains
+  
+    for (j in seq_along(Strains)) {
+      Dif.list[[i]][[j]] <- vector("list",length=2)
+      names(Dif.list[[i]][[j]]) <- c("UP", "DOWN")
+      
+      Naive.CellIDs = ObjectForScoring@meta.data %>% rownames_to_column(var="CellID") %>% .[whichall(CellsForScoring[i], ObjectForScoring@meta.data[,grep(IdentsForScoring, colnames(ObjectForScoring@meta.data))]),] %>% filter(timepoint=="0h" & strain==Strains[j]) %>% pull(CellID)
+      Treat.CellIDs = ObjectForScoring@meta.data %>% rownames_to_column(var="CellID") %>% .[whichall(CellsForScoring[i], ObjectForScoring@meta.data[,grep(IdentsForScoring, colnames(ObjectForScoring@meta.data))]),] %>% filter(timepoint==TimeForScoring & strain==Strains[j]) %>% pull(CellID)
+      
+      # Calculation for UP genes
+      Naive.mean <- ObjectForScoring@assays$RNA@scale.data[UPgenes, Naive.CellIDs] %>% apply(MARGIN = 1, mean) %>% matrix(ncol=1, nrow=length(UPgenes))
+      Dif.list[[i]][[j]][["UP"]] <- ObjectForScoring@assays$RNA@scale.data[UPgenes, Treat.CellIDs] %>% apply(MARGIN = 2, SubstractNaive) %>% reROWnames(.,replace=UPgenes)
+      rm(Naive.mean)
+      
+      # Calculation for DOWN genes
+      Naive.mean <- ObjectForScoring@assays$RNA@scale.data[DOWNgenes, Naive.CellIDs] %>% apply(MARGIN = 1, mean) %>% matrix(ncol=1, nrow=length(DOWNgenes))
+      Dif.list[[i]][[j]][["DOWN"]] <- ObjectForScoring@assays$RNA@scale.data[DOWNgenes, Treat.CellIDs] %>% apply(MARGIN = 2, SubstractNaive) %>% reROWnames(.,replace=DOWNgenes)
+      rm(list=c("Naive.mean","Naive.CellIDs","Treat.CellIDs"))
+    }
+  }
+  
+  Sco.list <- lapply(Dif.list, MergeUPDOWN)
+  
+  plot.list <- vector("list", length=length(CellsForScoring))
+  for (i in seq_along(CellsForScoring)) {
+  plot.list[[i]] <- ggplot(Sco.list[[i]], aes(x=Strain, y=Score)) +ggtitle(CellsForScoring[i]) + geom_violin() +    theme(legend.position="none", axis.title.x = element_blank(), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=14, face='plain'), axis.text.x = element_text(size=14, angle = 45, hjust = 1)) + geom_jitter(shape=16, size=NA) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "red", shape=95)  + theme_classic() + ylim(ymin, ymax)
+  }
+
+  return1 <- do.call("grid.arrange", c(plot.list, nrow = 1, top = Name))
+                     
+  wilcox.list <- vector("list", length=length(CellsForScoring))
+  for (i in seq_along(CellsForScoring)) {
+    x <- subset(Sco.list[[i]], subset=Sco.list[[i]]$Strain=="flox")$Score
+    y <- subset(Sco.list[[i]], subset=Sco.list[[i]]$Strain=="LMcreflox")$Score
+    wilcox.list[[i]] <- exactRankTests::wilcox.exact(x=x,y=y,paired=F)
+    names(wilcox.list)[i] <- CellsForScoring[i]
+    rm(list=c("x","y"))
+  }
+  
+  return2 <- print(wilcox.list)
+  return(list(return1, return2))
+  
+}
+```
+
+
+## 14-4. Calculate each score
+
+Efferocytosis
+```{r}
+Scoring_strains(
+  ObjectForScoring = MCAOall, 
+  IdentsForScoring = "final.celltype_forScoring", 
+  CellsForScoring = c("resMo","Ly6ChiMo_all","MP","Neut"),
+  TimeForScoring = "1h",  # Select from ObjectForScoring$timepoint : "0h" or "1h" or "3h"
+  UPgenes = Effero.UP,
+  DOWNgenes = Effero.DOWN,
+  Name = "Efferocytosis",
+  ymin = 100,
+  ymax = 800
+)
+```
+
+```{r}
+Scoring_strains(
+  ObjectForScoring = MCAOall, 
+  IdentsForScoring = "final.celltype", 
+  CellsForScoring = c("Ly6ChiMo","Ly6ChiMo_prolif"),
+  TimeForScoring = "1h",  # Select from ObjectForScoring$timepoint : "0h" or "1h" or "3h"
+  UPgenes = Effero.UP,
+  DOWNgenes = Effero.DOWN,
+  Name = "Efferocytosis",
+  ymin = 100,
+  ymax = 800
+)
+```
+
+
+LPS stimulation
+```{r}
+Scoring_strains(
+  ObjectForScoring = MCAOall, 
+  IdentsForScoring = "final.celltype_forScoring", 
+  CellsForScoring = c("resMo","Ly6ChiMo_all","MP","Neut"),
+  TimeForScoring = "1h",  # Select from ObjectForScoring$timepoint : "0h" or "1h" or "3h"
+  UPgenes = LPS.UP,
+  DOWNgenes = LPS.DOWN,
+  Name = "LPS stimulation",
+  ymin = 100,
+  ymax = 600
+)
+```
+
+IFNg stimulation
+```{r}
+Scoring_strains(
+  ObjectForScoring = MCAOall, 
+  IdentsForScoring = "final.celltype_forScoring", 
+  CellsForScoring = c("resMo","Ly6ChiMo_all","MP","Neut"),
+  TimeForScoring = "1h",  # Select from ObjectForScoring$timepoint : "0h" or "1h" or "3h"
+  UPgenes = Ifng.UP,
+  DOWNgenes = Ifng.DOWN,
+  Name = "Ifng stimulation",
+  ymin = 0,
+  ymax = 550
+)
+```
+
+IFNb stimulation
+```{r}
+Scoring_strains(
+  ObjectForScoring = MCAOall, 
+  IdentsForScoring = "final.celltype_forScoring", 
+  CellsForScoring = c("resMo","Ly6ChiMo_all","MP","Neut"),
+  TimeForScoring = "1h",  # Select from ObjectForScoring$timepoint : "0h" or "1h" or "3h"
+  UPgenes = Ifnb.UP,
+  DOWNgenes = Ifnb.DOWN,
+  Name = "Ifnb stimulation",
+  ymin = 500,
+  ymax = 2000
+)
+```
+
+
+## 14-5. Common genes between Effero.UP genes and Ly6ChiMo-DEGs (KO vs WT at MCAO-1h)
+
+### Prepare parameters
+```{r}
+if (isallsame(names(MCAOall$strain), names(MCAOall$final.celltype_forScoring))) {
+  MCAOall$strain_final.celltype_forScoring <- paste(MCAOall$strain, MCAOall$final.celltype_forScoring, sep="_")
+} else { print("Order of vectors are not same") }
+
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$strain_final.celltype_forScoring))) {
+  MCAOall$timepoint_strain_final.celltype_forScoring <- paste(MCAOall$timepoint, MCAOall$strain_final.celltype_forScoring, sep="_")
+} else { print("Order of vectors are not same") }
+
+MCAOall$timepoint_strain_final.celltype_forScoring %>% unique()
+```
+
+### DEGs in Ly6ChiMo: KO vs WT (MCAO-1h)
+```{r}
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+Ly6ChiMo_1h_DEGs <- FindMarkers(MCAOall, ident.1 = "1h_LMcreflox_Ly6ChiMo_all", ident.2 = "1h_flox_Ly6ChiMo_all")
+Ly6ChiMo_1h_UPinKO <- Ly6ChiMo_1h_DEGs %>% rownames_to_column(var="Gene") %>% filter(p_val_adj<=0.05) %>% filter(avg_logFC>0) %>% pull(Gene)
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+
+Ly6ChiMo_1h_UPinKO
+```
+
+### Venn diagram of Effero.UP genes and Ly6ChiMo-1h-KOvsWT
+```{r}
+EfferoUP_DEGs_list <- list(EfferoUP=Effero.UP, DEGs=Ly6ChiMo_1h_UPinKO)
+venn.diagram(EfferoUP_DEGs_list, filename="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/EfferoUP_DEGs_venn.jpg")
+```
+
+
+### Common genes of Effero.UP and Ly6ChiMo_1h_UPinKO
+```{r}
+intersect_genes <- intersect(Effero.UP, Ly6ChiMo_1h_UPinKO) 
+intersect_genes
+```
+
+### Heatmap of common genes of Effero.UP and Ly6ChiMo_1h_UPinKO
+```{r}
+# After PANTHER analysis of intersect_gene
+cellcyle_gene <- read.table("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/Intersected gene PANTHER/cellcycle.txt", header=F, sep="\t", quote = "", stringsAsFactors = F) %>% pull(V2)
+cytoskeleton_organization_gene <- read.table("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/Intersected gene PANTHER/cytoskeleton organization.txt", header=F, sep="\t", quote = "", stringsAsFactors = F) %>% pull(V2)
+```
+
+```{r}
+A <- setdiff(cellcyle_gene, intersect(cellcyle_gene, cytoskeleton_organization_gene))
+B <- intersect(cellcyle_gene, cytoskeleton_organization_gene)
+C <- setdiff(cytoskeleton_organization_gene, intersect(cellcyle_gene, cytoskeleton_organization_gene))
+D <- setdiff(intersect_genes, c(A,B,C))
+features <- c(A, B, C, D)
+rm(list=c("A","B","C","D"))
+
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+DoHeatmap(MCAOall, cells = WhichCells(MCAOall, idents = c("1h_flox_Ly6ChiMo_all","1h_LMcreflox_Ly6ChiMo_all")), features = features, draw.line=F) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(axis.text.y = element_text(size=15, face="plain"))
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+
+clipr::write_clip(intersect_genes)
+```
+
+
+
+# 15. Cd300a and Cd300b expression in each time point
+## 15-1. Prepare function
+```{r}
+# Combine metadata
+Combine_metadata <- function(metadata1, metadata2){
+  isallsame <- function(x, y) { all((x==y)==TRUE) }
+  if(all((names(metadata1)==names(metadata2))==TRUE)){
+    out <- paste(metadata1, metadata2, sep="_")
+  } else {
+    out <- stop("names (content of order) of two metadata are not same")
+  }
+  
+  # as factor
+  level <- expand.grid(levels(metadata1), levels(metadata2)) %>% apply(MARGIN = 1, function(x){paste(x[1],x[2],sep="_")})
+  out <- factor(out, levels = level)
+  return(out)
+}
+
+
+# VlnPlot with statistical analysis
+## Modified 'VlnPlot' function
+## Statistical analysis is using package "stats"
+## stats::pairwise.wilcox.test
+
+VlnPlot_with_stats <- function(object, 
+                               cells, 
+                               feature, 
+                               xaxis = levels(object$sample), 
+                               pt_size = 0,
+                               group_by = "sample",
+                               split_by = "strain",
+                               colors = c("white", "grey50"),
+                               errorbar_size = 10,
+                               errorbar_color = "black",
+                               title_size = 14,
+                               axis_title_y_size = 12,
+                               legend_position = "none",
+                               title = F,
+                               nrow = 1,  
+                               p_adjust_method="bonferroni"){
+  
+  # Prepare list objects of plot and stats
+  p_list <- vector("list", length=length(cells)) ; names(p_list) <- cells
+  stats_list <- vector("list", length=length(cells)) ; names(stats_list) <- cells
+  
+  for(i in seq_along(cells)){
+    # plot for each cell type
+    p_list[[i]] <- VlnPlot(object, idents = cells[i], features = feature, pt.size=pt_size, group.by = group_by, split.by = split_by, cols = colors)
+    p_list[[i]] <- p_list[[i]] + stat_summary(fun = mean, geom='point', size = errorbar_size, colour = errorbar_color, shape=95)
+    p_list[[i]] <- p_list[[i]] + ggtitle(cells[i]) + theme(plot.title = element_text(size = title_size), axis.title.x = element_blank(), axis.title.y = element_text(size = axis_title_y_size), legend.position = legend_position)
+    p_list[[i]] <- p_list[[i]] + scale_x_discrete(limits=xaxis)
+    
+    # stats for each cell type
+    data <- object@meta.data[WhichCells(object, idents = cells[i]),]
+    if(is.element(feature, colnames(object@meta.data))){
+      ## if feature is included in the colnames(object@meta.data) 
+      stats_list[[i]] <- stats::pairwise.wilcox.test(x=data[[feature]], g=data$stim, paired=F, p.adjust.method=p_adjust_method)
+      p_list[[i]] <- p_list[[i]] + ylab(feature)
+    } else {
+      ## if feature is NOT included in the colnames = gene or ADT feature
+      expression <- object@assays$RNA@data[feature,][rownames(data)]
+      stats_list[[i]] <- stats::pairwise.wilcox.test(x=expression, g=data$stim, paired=F, p.adjust.method=p_adjust_method)
+      p_list[[i]] <- p_list[[i]] + ylab(feature)
+    }
+  }
+  
+  # Title for wrap_plots or not
+  if(title==T){
+    p_list <- p_list %>% lapply(function(x){ x + theme(axis.title.y=element_blank()) })
+    plots <- patchwork::wrap_plots(p_list, nrow = nrow) + patchwork::plot_annotation(title=feature)
+  } else { 
+    plots <- patchwork::wrap_plots(p_list, nrow = nrow)
+  }
+ 
+  return(list(plots, stats_list))
+}
+```
+
+```{r}
+VlnPlot(MCAOall, idents="Ly6ChiMo_all", features = "Cd300lb", group.by = "stim", split.by = "strain", slot = "scale.data") + stat_summary(fun = mean, geom='point', size = 15, colour = "red", shape=95) + scale_x_discrete(limits=c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox"))
+```
+
+```{r}
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+VlnPlot_with_stats(MCAOall,
+                   cells = c("Ly6ChiMo_all","Neut"),
+                   feature = "Cd300a",
+                   xaxis=c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox"),
+                   group_by = "stim",
+                   split_by = "strain")
+```
+
+
+```{r}
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+VlnPlot_with_stats(MCAOall,
+                   cells = c("Ly6ChiMo_all","Neut"),
+                   feature = "Cd300lb",
+                   xaxis=c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox"),
+                   group_by = "stim",
+                   split_by = "strain")
+```
+
+
+```{r}
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+VlnPlot_with_stats(MCAOall,
+                   cells = c("Ly6ChiMo_all","Microglia"),
+                   feature = "Cd300a",
+                   xaxis=c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox"),
+                   group_by = "stim",
+                   split_by = "strain")
+```
+
+
+```{r}
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+VlnPlot_with_stats(MCAOall,
+                   cells = c("Ly6ChiMo_all","Microglia"),
+                   feature = "Cd300lb",
+                   xaxis=c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox"),
+                   group_by = "stim",
+                   split_by = "strain")
+```
+
+```{r}
+DimPlot(MCAOall, label = T)
+```
+
+
+```{r}
+FeaturePlot(MCAOall, features = "Cd300lb", max.cutoff = "q80")
+```
+
+
+
+
+
+
+
+
+
+
+-----------------------------------------------------------------------------------------------------------
+
+```{r}
+library(fgsea)
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+
+# Extract gene list from "after FindMarkers DEG data"
+# If genes are non-human genes, convert to human genes using "biomaRt" -> convert=T (default is convert=F) 
+# All duplicated genes are removed
+
+FindMarkers_to_Humangenelist <- function(DEG, pval_adj, convert=F) {
+  Data <- DEG %>% rownames_to_column(var="Gene")
+  Data <- Data %>% filter(p_val_adj <= pval_adj) %>% dplyr::select(Gene, avg_logFC)
+  Data$avg_logFC <- exp(Data$avg_logFC)
+  List <- Data$avg_logFC
+  names(List) <- Data$Gene
+  
+  if (convert) {
+    require("biomaRt")
+    human = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+    mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+    
+    genesV2 = getLDS(attributes = c("mgi_symbol"), filters = "mgi_symbol", values = names(List), mart = mouse, attributesL = c("hgnc_symbol"), martL = human, uniqueRows=F)
+    
+    
+    # Remove duplicates in both mouse and human
+    mouse_dupli_pos <- whichall(genesV2$MGI.symbol[duplicated(genesV2$MGI.symbol)], genesV2$MGI.symbol)
+    human_dupli_pos <- whichall(genesV2$HGNC.symbol[duplicated(genesV2$HGNC.symbol)], genesV2$HGNC.symbol)
+    dupli_pos <- c(mouse_dupli_pos, human_dupli_pos) %>% unique()
+    
+    genesV2 <- genesV2[-dupli_pos,]
+    List <- List[genesV2$MGI.symbol]
+    names(List) <- genesV2$HGNC.symbol
+  } else {}
+  
+  return(List)
+}
+
+gene_list <- FindMarkers_to_Humangenelist(Ly6ChiMo_1h_DEGs, pval_adj = 0.1, convert = F)
+
+EfferoPathway_GSEA <- vector("list", length=2)
+names(EfferoPathway_GSEA) <- c("Effero_UP","Effero_DOWN")
+EfferoPathway_GSEA[["Effero_UP"]] <- Effero.UP
+EfferoPathway_GSEA[["Effero_DOWN"]] <- Effero.DOWN
+
+fgseaRes <- fgsea(pathways = EfferoPathway_GSEA, 
+                  stats    = gene_list,
+                  minSize  = 15,
+                  maxSize  = 500,
+                  nperm = 1000) %>% as.tibble()
+fgseaRes
+
+plotEnrichment(EfferoPathway_GSEA[["Effero_UP"]], gene_list) + labs(title="Effero_UP")
+plotEnrichment(EfferoPathway_GSEA[["Effero_DOWN"]], gene_list) + labs(title="Effero_DOWN")
+```
+
+
+
+
+
+
+
+
+
+```{r}
+VlnPlot(MCAOall, idents = "Tcell", features = "Tcf7", group.by = "stim") + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank())
+```
+
+```{r}
+FeaturePlot(MCAOall, features = "Cxcr4", max.cutoff = "q70")
+```
+
+
+```{r}
+Ly6ChiMo_1h_GSEA <- Ly6ChiMo_1h_DEGs %>% rownames_to_column(var="NAME")
+Ly6ChiMo_1h_GSEA <- Ly6ChiMo_1h_GSEA %>% filter(p_val_adj <= 0.1) %>% dplyr::select(NAME, avg_logFC)
+Ly6ChiMo_1h_GSEA <- data.frame(NAME=Ly6ChiMo_1h_GSEA$NAME, Description="na", flox=1, LMcreflox=exp(Ly6ChiMo_1h_GSEA$avg_logFC), stringsAsFactors = F)
+Ly6ChiMo_1h_GSEA <- Ly6ChiMo_1h_GSEA %>% filter(NAME != "Lyz2") %>% filter(NAME != "Cd300a")
+Ly6ChiMo_1h_GSEA
+
+write.csv(Ly6ChiMo_1h_GSEA, file="/Users/kazumasa/Desktop/Dry_analysis/kkd9_Tcell_Stroke/GSEA/Ly6ChiMo_1h_GSEA.csv")
+```
+
+

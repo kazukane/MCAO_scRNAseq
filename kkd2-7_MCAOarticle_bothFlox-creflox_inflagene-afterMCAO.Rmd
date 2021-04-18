@@ -1,0 +1,940 @@
+---
+title: "kkd2-7  MCAOarticle, both flox and creflox, inflammatory genes after MCAO"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+library(VennDiagram)
+library(clipr)
+library(ggsci)
+
+# Install font for plot
+library(showtext)
+font_install(source_han_serif())
+showtext_auto()
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+## Gene name: HUMAN to Mouse pattern
+HUtoMSpattern <- function(x) { paste0(stringr::str_sub(x,1,1), tolower(stringr::str_sub(x,2,-1))) }
+
+# Parameters
+SampleIDs <- c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox")
+nSample <- length(SampleIDs)
+```
+
+
+# 1. Read Seurat object
+```{r}
+MCAOall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+```
+
+```{r}
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Tcell_prolif","Bcell","NK","Others","Others_prolif")
+DimPlot(MCAOall, reduction = "umap", order = rev(order))
+```
+
+
+# 2. Defferential expressed genes of after MCAO (MCAO-3h vs Naive)
+```{r}
+Idents(MCAOall) <- MCAOall$timepoint
+MCAO_DEG_3HvsN <-  FindMarkers(MCAOall, ident.1 = "3h", ident.2 = "0h")
+Idents(MCAOall) <- MCAOall$final.celltype
+
+MCAO_DEG_3HvsN <- MCAO_DEG_3HvsN %>% rownames_to_column(var = "Gene")
+MCAO_DEG_3HvsN
+```
+
+
+# 3. GO enrichment analysis using DAVID
+```{r}
+MCAO_DEG_3HvsN_UPgenes <- MCAO_DEG_3HvsN %>% filter(avg_logFC>0 & p_val_adj<0.05) %>% pull(Gene)
+write_clip(MCAO_DEG_3HvsN_UPgenes)
+```
+
+DAVID, Enrichment analysis → GO: BP (biological pathway)
+https://david.ncifcrf.gov/tools.jsp
+Download result file as:
+/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/CD45_3hUP-DEGs_DAVID-GOBP.txt
+
+### Analysis after GO enrichment analysis (DAVID_GO-BP)
+```{r}
+MCAO_3hUP_GOBP <- read.table("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/CD45_3hUP-DEGs_DAVID-GOBP.txt", header=T, sep="\t", quote = "", stringsAsFactors = F)
+head(MCAO_3hUP_GOBP, n=10)
+```
+
+### Select GO terms
+```{r}
+MCAO_3hUP_GOBP_selected <- MCAO_3hUP_GOBP %>% filter(FDR<=0.05) %>% arrange(desc(Count))
+#not using code: %>% top_n(n = 10, wt = Count)
+
+write.csv(MCAO_3hUP_GOBP_selected, file="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/MCAO_3hUP_GOBP_selected.csv")
+MCAO_3hUP_GOBP_selected
+```
+
+### Inflammatory genes up-regulated in MG of MCAO-3h
+```{r}
+MCAO_DEGs_infla <- MCAO_3hUP_GOBP %>% filter(Term=="GO:0006954~inflammatory response") %>% pull(Genes) %>% strsplit(", ") %>% unlist() %>% HUtoMSpattern()
+
+# Re-order genes based on the value of "avg_log_FC" in DEG data
+MCAO_DEG_3HvsN_infla <- MCAO_DEG_3HvsN %>% filter(Gene %in% MCAO_DEGs_infla) %>% arrange(desc(avg_logFC))
+MCAO_DEGs_infla <- MCAO_DEG_3HvsN_infla %>% pull(Gene)
+MCAO_DEGs_infla
+```
+
+# 4. Inflammatory gene expressions of each cell type
+Inflammatory gene: 17 genes detected in # 2. (genes in the "GO:0006954~inflammatory response")
+
+### Prepare label
+```{r}
+if (isallsame(names(MCAOall$final.celltype), names(MCAOall$timepoint))) {
+  MCAOall$time_final.celltype <- paste(MCAOall$timepoint, MCAOall$final.celltype, sep="_")
+  names(MCAOall$time_final.celltype) <- names(MCAOall$timepoint)
+} else {"ERROR: orders of cellIDs are not same"}
+```
+
+## 4-1. Average in each cell type
+### Functions
+```{r}
+# times: Select from "0h","1h","3h"
+
+ModulePlot_perCelltype <- function(module, gene.data, named.vector, times, limits=F, ymin, ymax){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  TimesPosition <- grepall(times, allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    data <- rbind(data, data.frame(Sample=samples[i], Expression=apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)))
+  }
+  data <- na.omit(data)
+  
+  return <- ggplot(data, aes(x=Sample, y=Expression))
+  return <- return + ggtitle(times) + geom_violin(scale="width") + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x =element_blank(), axis.text.x = element_text(size=12, angle = 45, hjust = 1), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'))  + if(limits){ylim(ymin,ymax)}else{} + theme_classic() 
+ 
+  return(return)
+}
+
+# not using code: geom_jitter(shape=16, size=pt.size)
+```
+
+### Visualization
+```{r}
+ModulePlot_perCelltype(module = MCAO_DEGs_infla,
+                       gene.data = MCAOall@assays$RNA@data,
+                       named.vector = MCAOall$time_final.celltype,
+                       times="0h") + scale_x_discrete(limits=paste0("0h_",order))
+
+ModulePlot_perCelltype(module = MCAO_DEGs_infla,
+                       gene.data = MCAOall@assays$RNA@data,
+                       named.vector = MCAOall$time_final.celltype,
+                       times="3h") + scale_x_discrete(limits=paste0("3h_",order))
+```
+
+## 4-2. Total in each cell type
+### Functions
+```{r}
+# times: Select from "0h","1h","3h"
+
+ModulePlot_perCelltype_total <- function(module, gene.data, named.vector, times, limits=F, ymin, ymax){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  TimesPosition <- grepall(times, allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data <- na.omit(data)
+  
+  return <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(times) + geom_bar(stat = "identity") + theme(legend.position="none", axis.title.x =element_blank(), axis.text.x = element_text(size=12, angle = 45, hjust = 1), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'))  + if(limits){ylim(ymin,ymax)}else{} + theme_classic() 
+ 
+  return(return)
+}
+```
+
+### Visualization
+```{r}
+ModulePlot_perCelltype_total(module = MCAO_DEGs_infla,
+                             gene.data = MCAOall@assays$RNA@data,
+                             named.vector = MCAOall$time_final.celltype,
+                             times="0h",
+                             limits=T, 
+                             ymin=0, 
+                             ymax=7000) + scale_x_discrete(limits=paste0("0h_",order))
+```
+
+```{r}
+ModulePlot_perCelltype_total(module = MCAO_DEGs_infla,
+                             gene.data = MCAOall@assays$RNA@data,
+                             named.vector = MCAOall$time_final.celltype,
+                             times="1h",
+                             limits=T, 
+                             ymin=0, 
+                             ymax=7000) + scale_x_discrete(limits=paste0("1h_",order))
+```
+
+```{r}
+ModulePlot_perCelltype_total(module = MCAO_DEGs_infla,
+                             gene.data = MCAOall@assays$RNA@data,
+                             named.vector = MCAOall$time_final.celltype,
+                             times="3h",
+                             limits=T, 
+                             ymin=0, 
+                             ymax=7000) + scale_x_discrete(limits=paste0("3h_",order))
+```
+
+## 4-3. Total: MCAO minus Naive
+### Functions
+```{r}
+# times: Select from "1h" or "3h"
+
+ModulePlot_perCelltype_total_minusNaive <- function(module, gene.data, named.vector, times, limits=F, ymin, ymax){
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  # Select sample names
+  allsamples <- unique(named.vector)
+  TimesPosition <- grepall(times, allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  data_MCAO <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data_MCAO <- rbind(data_MCAO, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data_MCAO <- rbind(data_MCAO, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data_MCAO <- rbind(data_MCAO, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data_MCAO <- na.omit(data_MCAO)
+  data_MCAO$Sample <- data_MCAO$Sample %>% strsplit("h_") %>% lapply(function(x){x[2]}) %>% unlist()
+  data_MCAO <- data_MCAO[whichall(order, data_MCAO$Sample),]
+  
+  # Naive sample names
+  TimesPosition <- grepall("0h", allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  data_Naive <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data_Naive <- rbind(data_Naive, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data_Naive <- rbind(data_Naive, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data_Naive <- rbind(data_Naive, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data_Naive <- na.omit(data_Naive)
+  data_Naive <- rbind(data_Naive, data.frame(Sample="0h_Others", Expression=0))
+  data_Naive$Sample <- data_Naive$Sample %>% strsplit("h_") %>% lapply(function(x){x[2]}) %>% unlist()
+  data_Naive <- data_Naive[whichall(order, data_Naive$Sample),]
+  
+  if (isallsame(data_MCAO$Sample, data_Naive$Sample)) {
+    data <- data.frame(Sample=data_MCAO$Sample, Expression=data_MCAO$Expression-data_Naive$Expression)
+  } else { message("ERROR: order of the samples are not same") }
+
+  return <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(paste0(times, " - Naive")) + geom_bar(stat = "identity") + theme_classic() + theme(legend.position="none", axis.title.x =element_blank(), axis.text.x = element_text(size=12, angle = 45, hjust = 1), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'))  + if(limits){ylim(ymin,ymax)}else{}  
+ 
+  return(return)
+}
+```
+
+```{r}
+ModulePlot_perCelltype_total_minusNaive(module = MCAO_DEGs_infla,
+                                        gene.data = MCAOall@assays$RNA@data,
+                                        named.vector = MCAOall$time_final.celltype,
+                                        times="1h",
+                                        limits=T,
+                                        ymin=-120,
+                                        ymax=2200) + scale_x_discrete(limits=order)
+```
+
+```{r}
+ModulePlot_perCelltype_total_minusNaive(module = MCAO_DEGs_infla,
+                                        gene.data = MCAOall@assays$RNA@data,
+                                        named.vector = MCAOall$time_final.celltype,
+                                        times="3h",
+                                        limits=F) + scale_x_discrete(limits=order)
+```
+
+
+## 4-4. Total: MCAO minus Naive, combine 1h and 3h results
+### Functions
+```{r}
+# times: Select from "1h" or "3h"
+
+ModulePlot_perCelltype_total_minusNaive_comb <- function(module, gene.data, named.vector, limits=F, ymin, ymax, fill_color){
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  allsamples <- unique(named.vector)
+  
+  # MCAO-1h sample names
+  TimesPosition <- grepall(c("1h"), allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  data_MCAO_1h <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data_MCAO_1h <- rbind(data_MCAO_1h, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data_MCAO_1h <- rbind(data_MCAO_1h, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data_MCAO_1h <- rbind(data_MCAO_1h, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data_MCAO_1h <- na.omit(data_MCAO_1h)
+  data_MCAO_1h$Sample <- data_MCAO_1h$Sample %>% strsplit("h_") %>% lapply(function(x){x[2]}) %>% unlist()
+  data_MCAO_1h <- data_MCAO_1h[whichall(order, data_MCAO_1h$Sample),]
+  
+  # MCAO-3h sample names
+  TimesPosition <- grepall(c("3h"), allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  data_MCAO_3h <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data_MCAO_3h <- rbind(data_MCAO_3h, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data_MCAO_3h <- rbind(data_MCAO_3h, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data_MCAO_3h <- rbind(data_MCAO_3h, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data_MCAO_3h <- na.omit(data_MCAO_3h)
+  data_MCAO_3h$Sample <- data_MCAO_3h$Sample %>% strsplit("h_") %>% lapply(function(x){x[2]}) %>% unlist()
+  data_MCAO_3h <- data_MCAO_3h[whichall(order, data_MCAO_3h$Sample),]
+  
+  # Naive sample names
+  TimesPosition <- grepall("0h", allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  data_Naive <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data_Naive <- rbind(data_Naive, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data_Naive <- rbind(data_Naive, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data_Naive <- rbind(data_Naive, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data_Naive <- na.omit(data_Naive)
+  data_Naive <- rbind(data_Naive, data.frame(Sample="0h_Others", Expression=0))
+  data_Naive$Sample <- data_Naive$Sample %>% strsplit("h_") %>% lapply(function(x){x[2]}) %>% unlist()
+  data_Naive <- data_Naive[whichall(order, data_Naive$Sample),]
+  
+  # MCAO-1h minus Naive
+  if (isallsame(data_MCAO_1h$Sample, data_Naive$Sample)) {
+    data_1h <- data.frame(Sample=data_MCAO_1h$Sample, Expression=data_MCAO_1h$Expression-data_Naive$Expression, Time="1h")
+  } else { message("ERROR: order of the samples are not same") }
+  
+  # MCAO-3h minus Naive
+  if (isallsame(data_MCAO_3h$Sample, data_Naive$Sample)) {
+    data_3h <- data.frame(Sample=data_MCAO_3h$Sample, Expression=data_MCAO_3h$Expression-data_Naive$Expression, Time="3h")
+  } else { message("ERROR: order of the samples are not same") }
+
+  # Combine 1h and 3h data
+  data <- rbind(data_1h, data_3h)
+  
+  # making graph
+  plot <- ggplot(data, aes(x=Sample, y=Expression, fill=Time)) + ggtitle("minus Naive") + geom_bar(stat = "identity", position = "dodge") + theme_classic() + theme(axis.title.x =element_blank(), axis.text.x = element_text(size=12, angle = 45, hjust = 1), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'))  + if(limits){ylim(ymin,ymax)}else{}  
+  plot <- plot + scale_fill_manual(values = fill_color)
+ 
+  return(plot)
+}
+```
+
+```{r}
+ModulePlot_perCelltype_total_minusNaive_comb(module = MCAO_DEGs_infla,
+                                             gene.data = MCAOall@assays$RNA@data,
+                                             named.vector = MCAOall$time_final.celltype,
+                                             limits=F,
+                                             fill_color=c("green3", "indianred1")) + scale_x_discrete(limits=order)
+```
+
+
+
+# 5. Inflammatory gene expressions in Microglia and Neutrophil
+### Prepare label
+```{r}
+if(isallsame(names(MCAOall$strain),names(MCAOall$time_final.celltype))) {
+  MCAOall$strain_time_final.celltype <- paste(MCAOall$strain, MCAOall$time_final.celltype, sep="_")
+  names(MCAOall$strain_time_final.celltype) <- names(MCAOall$strain)
+}
+```
+
+### Prepare function
+```{r}
+# idents: Select from "levels(MCAOall@active.ident)"
+# times: Select from "0h","1h","3h"
+# strains: select from "flox", "LMcreflox"
+# p.adjust.method: "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none"
+
+ModulePlot <- function(module, gene.data, named.vector, idents, times, strains=c("flox", "LMcreflox"), limits=F, ymin, ymax, p.adjust.method="bonferroni"){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  CellPosition <- grepall(idents, allsamples)
+  TimesPosition <- grepall(times, allsamples)
+  StrainPosition <- grepall(strains, allsamples)
+  samples <- allsamples[Reduce(intersect, list(CellPosition,TimesPosition,StrainPosition))]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    data <- rbind(data, data.frame(Sample=samples[i], Expression=apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)))
+  }
+  data <- na.omit(data)
+  
+  return1 <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(idents)  + theme_classic() + geom_violin(scale="width")  + scale_x_discrete(limits=samples,   label=unlist(lapply(strsplit(samples,"_"),head,n=1))) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x =element_blank(), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'), axis.text.x = element_text(size=20, angle = 45, hjust = 1))  + if(limits){ylim(ymin,ymax)}else{} 
+# + theme_classic() 
+
+  return2 <- stats::pairwise.wilcox.test(x=data$Expression, g=data$Sample, paired=F, p.adjust.method=p.adjust.method)
+  
+  return(list(return1, return2))
+}
+
+# not using code: geom_jitter(shape=16, size=pt.size)
+```
+
+### Visualization
+```{r}
+ModulePlot(module=MCAO_DEGs_infla,
+           gene.data=MCAOall@assays$RNA@data, 
+           named.vector=MCAOall$strain_time_final.celltype, 
+           idents="Microglia", 
+           times=c("0h","1h","3h"), 
+           strains=c("flox", "LMcreflox"), 
+           limits=F, 
+           p.adjust.method="bonferroni") 
+```
+
+```{r}
+ModulePlot(module=MCAO_DEGs_infla,
+           gene.data=MCAOall@assays$RNA@data, 
+           named.vector=MCAOall$strain_time_final.celltype, 
+           idents="Neut", 
+           times=c("0h","1h","3h"), 
+           strains=c("flox", "LMcreflox"), 
+           limits=F, 
+           p.adjust.method="bonferroni") 
+```
+
+
+```{r}
+if (isallsame(names(MCAOall$strain), names(MCAOall$timepoint))) {
+  MCAOall$strain_time <- paste(MCAOall$strain, MCAOall$timepoint, sep="_")
+  names(MCAOall$strain_time) <- names(MCAOall$strain)
+} else {"ERROR: orders of cellIDs are not same"}
+```
+
+
+```{r}
+ModulePlot(module=MCAO_DEGs_infla,
+           gene.data=MCAOall@assays$RNA@data, 
+           named.vector=MCAOall$strain_time, 
+           idents="h", 
+           times=c("0h","1h","3h"), 
+           strains=c("flox", "LMcreflox"), 
+           limits=F, 
+           p.adjust.method="bonferroni") 
+```
+
+
+# 6. Heatmap of MCAO_DEGs_infla in Microglia and Neutrophil
+
+Microglia
+```{r}
+# Heatmap
+Idents(MCAOall) <- MCAOall$strain_time_final.celltype
+DoHeatmap(MCAOall, cells=WhichCells(MCAOall, idents = c("flox_0h_Microglia","LMcreflox_0h_Microglia","flox_1h_Microglia","LMcreflox_1h_Microglia","flox_3h_Microglia","LMcreflox_3h_Microglia")), features = MCAO_DEGs_infla, draw.line = FALSE) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(legend.position="none", axis.title.y =element_blank())
+Idents(MCAOall) <- MCAOall$final.celltype
+```
+
+Neutrophil
+```{r}
+# Heatmap
+Idents(MCAOall) <- MCAOall$strain_time_final.celltype
+DoHeatmap(MCAOall, cells=WhichCells(MCAOall, idents = c("flox_0h_Neut","LMcreflox_0h_Neut","flox_1h_Neut","LMcreflox_1h_Neut","flox_3h_Neut","LMcreflox_3h_Neut")), features = MCAO_DEGs_infla, draw.line = FALSE) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(legend.position="none", axis.title.y =element_blank())
+Idents(MCAOall) <- MCAOall$final.celltype
+```
+
+
+# 7. Violin plot and Heatmap of MCAO_DEGs_infla in Ly6Chi monocytes (revise)
+
+## 7-1. Combine Ly6ChiMo and Ly6ChiMo_prolif
+```{r}
+MCAOall$final.celltype_Ly6ChiMoComb = MCAOall$final.celltype %>% replace(grep("^Ly6ChiMo", MCAOall$final.celltype), "Ly6ChiMo_all")
+MCAOall$final.celltype_Ly6ChiMoComb %>% unique
+
+Idents(MCAOall) <- MCAOall$final.celltype_Ly6ChiMoComb
+DimPlot(object = MCAOall, reduction = "umap",  order=rev(levels(Idents(MCAOall))), label=T, label.size=3) 
+```
+
+## 7-2. Violin plot
+
+### Prepare label
+```{r}
+if (isallsame(names(MCAOall$final.celltype_Ly6ChiMoComb), names(MCAOall$timepoint))) {
+  MCAOall$time_final.celltype_Ly6ChiMoComb <- paste(MCAOall$timepoint, MCAOall$final.celltype_Ly6ChiMoComb, sep="_")
+  names(MCAOall$time_final.celltype_Ly6ChiMoComb) <- names(MCAOall$timepoint)
+} else {"ERROR: orders of cellIDs are not same"}
+
+if(isallsame(names(MCAOall$strain),names(MCAOall$time_final.celltype_Ly6ChiMoComb))) {
+  MCAOall$strain_time_final.celltype_Ly6ChiMoComb <- paste(MCAOall$strain, MCAOall$time_final.celltype_Ly6ChiMoComb, sep="_")
+  names(MCAOall$strain_time_final.celltype_Ly6ChiMoComb) <- names(MCAOall$strain)
+}
+```
+
+### Plotting
+```{r}
+ModulePlot(module=MCAO_DEGs_infla,
+           gene.data=MCAOall@assays$RNA@data, 
+           named.vector=MCAOall$strain_time_final.celltype_Ly6ChiMoComb, 
+           idents="Ly6ChiMo_all", 
+           times=c("0h","1h","3h"), 
+           strains=c("flox", "LMcreflox"), 
+           limits=F, 
+           p.adjust.method="bonferroni") 
+```
+
+## 7-3. Heatmap
+```{r}
+Idents(MCAOall) <- MCAOall$strain_time_final.celltype_Ly6ChiMoComb
+DoHeatmap(MCAOall, cells=WhichCells(MCAOall, idents = c("flox_0h_Ly6ChiMo_all","LMcreflox_0h_Ly6ChiMo_all","flox_1h_Ly6ChiMo_all","LMcreflox_1h_Ly6ChiMo_all","flox_3h_Ly6ChiMo_all","LMcreflox_3h_Ly6ChiMo_all")), features = MCAO_DEGs_infla, draw.line = FALSE) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(legend.position="none", axis.title.y =element_blank())
+Idents(MCAOall) <- MCAOall$final.celltype_Ly6ChiMoComb
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----------------------------------------------------------------------------------------------------------------------
+
+
+```{r}
+# idents: Select from "levels(MCAOall@active.ident)"
+# times: Select from "0h","1h","3h"
+# strains: select from "flox", "LMcreflox"
+# p.adjust.method: "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none"
+
+ModulePlot_sum <- function(module, gene.data, named.vector, idents, times, strains=c("flox", "LMcreflox"), limits=F, ymin, ymax, p.adjust.method="bonferroni"){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  CellPosition <- grepall(idents, allsamples)
+  TimesPosition <- grepall(times, allsamples)
+  StrainPosition <- grepall(strains, allsamples)
+  samples <- allsamples[Reduce(intersect, list(CellPosition,TimesPosition,StrainPosition))]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data <- na.omit(data)
+  
+  return <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(idents) + geom_bar(stat = "identity") + scale_x_discrete(limits=samples,   label=unlist(lapply(strsplit(samples,"_"),head,n=1))) + theme(legend.position="none", axis.title.x =element_blank(), axis.text.x = element_text(size=12, angle = 45, hjust = 1), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'))  + if(limits){ylim(ymin,ymax)}else{} + theme_classic() 
+ 
+  return(return)
+}
+
+# not using code: geom_jitter(shape=16, size=pt.size)
+```
+
+```{r}
+ModulePlot_sum(module=Inflagenes, 
+           gene.data=MCAOall@assays$RNA@data, 
+           named.vector=MCAOall$strain_time_final.celltype, 
+           idents="Microglia", 
+           times=c("0h","1h","3h"), 
+           strains=c("flox", "LMcreflox"), 
+           limits=F, 
+           p.adjust.method="bonferroni") 
+```
+
+
+
+
+
+# 6. Analyze Tcell DEGs by GSEA (R)
+## 6-1. Load packages required for GSEA
+```{r}
+library(fgsea)
+library(data.table)
+library(ggplot2)
+```
+
+fgsea: Fast gene set enrichment analysis (R package for GSEA)
+Github: https://github.com/ctlab/fgsea
+Tutorial: http://bioconductor.org/packages/devel/bioc/vignettes/fgsea/inst/doc/fgsea-tutorial.html
+
+## 6-2. Prepare genelist from "after FindMarkers DEG data" and convert to Human genes
+
+Prepare function
+making gene_list with Fold change (linear) from an object after Seurat-FindMarkers
+```{r}
+# Extract gene list from "after FindMarkers DEG data"
+# If genes are non-human genes, convert to human genes using "biomaRt" -> convert=T (default is convert=F) 
+# All duplicated genes are removed
+
+FindMarkers_to_Humangenelist <- function(DEG, pval_adj, convert=F) {
+  Data <- DEG %>% rownames_to_column(var="Gene")
+  Data <- Data %>% filter(p_val_adj <= pval_adj) %>% dplyr::select(Gene, avg_logFC)
+  Data$avg_logFC <- exp(Data$avg_logFC)
+  List <- Data$avg_logFC
+  names(List) <- Data$Gene
+  
+  if (convert) {
+    require("biomaRt")
+    human = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+    mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+    
+    genesV2 = getLDS(attributes = c("mgi_symbol"), filters = "mgi_symbol", values = names(List), mart = mouse, attributesL = c("hgnc_symbol"), martL = human, uniqueRows=F)
+    
+    
+    # Remove duplicates in both mouse and human
+    mouse_dupli_pos <- whichall(genesV2$MGI.symbol[duplicated(genesV2$MGI.symbol)], genesV2$MGI.symbol)
+    human_dupli_pos <- whichall(genesV2$HGNC.symbol[duplicated(genesV2$HGNC.symbol)], genesV2$HGNC.symbol)
+    dupli_pos <- c(mouse_dupli_pos, human_dupli_pos) %>% unique()
+    
+    genesV2 <- genesV2[-dupli_pos,]
+    List <- List[genesV2$MGI.symbol]
+    names(List) <- genesV2$HGNC.symbol
+  } else {}
+  
+  return(List)
+}
+```
+
+
+Run "FindMarkers_to_Humangenelist"
+```{r}
+gene_list <- FindMarkers_to_Humangenelist(MCAO_DEG_3HvsN, pval_adj = 0.1, convert = T)
+```
+
+## 6-3. Prepare pathway lists from MSigDB
+MSigDB: https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp#H
+
+Prepare pathway list
+- H: hallmark gene sets
+- C2: curated gene sets
+- C5.bp: GO gene sets (biological process)
+- C7: immunologic gene sets
+
+```{r}
+pathways <- c("h.all","c2.all","c5.bp","c7.all")
+pathway_list <- vector("list", length=length(pathways))
+names(pathway_list) <- pathways
+
+pathway_list[["h.all"]] <- gmtPathways("/Users/kazumasa/Desktop/Dry_analysis/GSEA_MSigDB/symbols/h.all.v7.0.symbols.gmt")
+pathway_list[["c2.all"]] <- gmtPathways("/Users/kazumasa/Desktop/Dry_analysis/GSEA_MSigDB/symbols/c2.all.v7.0.symbols.gmt")
+pathway_list[["c5.bp"]] <- gmtPathways("/Users/kazumasa/Desktop/Dry_analysis/GSEA_MSigDB/symbols/c5.bp.v7.0.symbols.gmt")
+pathway_list[["c7.all"]] <- gmtPathways("/Users/kazumasa/Desktop/Dry_analysis/GSEA_MSigDB/symbols/c7.all.v7.0.symbols.gmt")
+```
+
+## 6-4. RUN fgsea
+```{r}
+fgseaRes_list <- vector("list", length=length(pathways))
+names(fgseaRes_list) <- pathways
+
+for(i in seq_along(pathways)) {
+  fgseaRes_list[[pathways[i]]] <- fgsea(pathways = pathway_list[[pathways[i]]], 
+                                           stats    = gene_list,
+                                           minSize  = 15,
+                                           maxSize  = 500,
+                                           nperm = 1000)
+}
+
+fgseaRes_list <- lapply(fgseaRes_list, as.tibble)
+```
+
+
+## 6-5. Summarize the results
+
+### number of the pathways: padj <= 0.05
+```{r}
+fgseaRes_list %>% lapply(function(x){filter(x,padj <= 0.05) %>% nrow()}) %>% unlist()
+```
+
+### select the pathways (padj <= 0.05), and arrange based on NES value
+```{r}
+fgseaRes_list_sel <- fgseaRes_list %>% lapply(function(x){filter(x, padj <= 0.05) %>% arrange(desc(NES))})
+```
+
+```{r}
+fgseaRes_list_sel[["c7.all"]]
+```
+
+```{r}
+fgseaRes_list_sel[["h.all"]]
+```
+
+### Visualize summary results
+Select pathways
+- for NES>0 : UP$
+- for NES<0 : DN$
+
+Prepare function
+```{r}
+GSEA_Vis <- function(Res) {
+  #plot the normalized enrichment score
+  ggplot(Res,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=NES<0)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score") +
+  theme_minimal()
+}
+
+GSEA_Vis_separateUPDN <- function(Res) {
+  pathways_UP <- Res %>% filter(NES>0) %>% .[grep("\\UP$",.$pathway),] %>% pull(pathway)
+  pathways_DN <- Res %>% filter(NES<0) %>% .[grep("\\DN$",.$pathway),] %>% pull(pathway)
+  Res2 <- Res %>% filter(pathway %in% c(pathways_UP, pathways_DN))
+  
+  #plot the normalized enrichment score
+  ggplot(Res2,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=NES<0)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score") +
+  theme_minimal()
+}
+```
+
+Visualization
+- Only “fgseaRes_1h_list_sel[[“c7.all”]] has multiple pathways
+```{r}
+GSEA_Vis(fgseaRes_list_sel[["h.all"]])
+```
+
+### Visualize by Enrichment plots
+
+1H
+```{r}
+plotEnrichment(pathway_list[["h.all"]][["HALLMARK_INFLAMMATORY_RESPONSE"]], gene_list, ticksSize = 0.5) + labs(title="HALLMARK_INFLAMMATORY_RESPONSE")
+```
+
+```{r}
+Inflagene_GSEA <- fgseaRes_list_sel[["h.all"]] %>% filter(pathway=="HALLMARK_INFLAMMATORY_RESPONSE") %>% pull(leadingEdge) %>% unlist()
+
+# Convert to mouse genes
+require("biomaRt")
+human = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+    
+Inflagene_GSEA_toMs = getLDS(attributes = c("hgnc_symbol"), filters = "hgnc_symbol", values = Inflagene_GSEA, mart = human, attributesL = c("mgi_symbol"), martL = mouse, uniqueRows=F)
+    
+Inflagene_GSEA_toMs <- Inflagene_GSEA_toMs$MGI.symbol %>% unique()
+```
+
+
+
+```{r}
+ModulePlot_perCelltype(module = Inflagene_GSEA_toMs,
+                       gene.data = MCAOall@assays$RNA@data,
+                       named.vector = MCAOall$time_final.celltype,
+                       times="0h") + scale_x_discrete(limits=paste0("0h_",order))
+
+ModulePlot_perCelltype(module = Inflagene_GSEA_toMs,
+                       gene.data = MCAOall@assays$RNA@data,
+                       named.vector = MCAOall$time_final.celltype,
+                       times="3h") + scale_x_discrete(limits=paste0("3h_",order))
+```
+
+
+
+```{r}
+# times: Select from "0h","1h","3h"
+
+ModulePlot_perCelltype_total <- function(module, gene.data, named.vector, times, limits=F, ymin, ymax){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  TimesPosition <- grepall(times, allsamples)
+  samples <- allsamples[TimesPosition]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    if(length(which(colnames(gene.data)==samples[i]))>1) {
+      expression <- apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)
+      Expression_total <- sum(expression)
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=Expression_total))
+    } else if (length(which(colnames(gene.data)==samples[i]))==1){
+      expression <- mean(gene.data[module,which(colnames(gene.data)==samples[i])])
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=expression))
+    } else {
+      data <- rbind(data, data.frame(Sample=samples[i], Expression=0))
+    }
+  }
+  data <- na.omit(data)
+  
+  return <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(times) + geom_bar(stat = "identity") + theme(legend.position="none", axis.title.x =element_blank(), axis.text.x = element_text(size=12, angle = 45, hjust = 1), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'))  + if(limits){ylim(ymin,ymax)}else{} + theme_classic() 
+ 
+  return(return)
+}
+```
+
+```{r}
+timepoints <- c("0h","1h","3h")
+for(i in seq_along(timepoints)) {
+  plot <- ModulePlot_perCelltype_total(module = Inflagene_GSEA_toMs,
+                             gene.data = MCAOall@assays$RNA@data,
+                             named.vector = MCAOall$time_final.celltype,
+                             times=timepoints[i],
+                             limits=T, 
+                             ymin=0, 
+                             ymax=7000) + scale_x_discrete(limits=paste(timepoints[i],order,sep="_"))
+  print(plot)
+}
+```
+
+```{r}
+# idents: Select from "levels(MCAOall@active.ident)"
+# times: Select from "0h","1h","3h"
+# strains: select from "flox", "LMcreflox"
+# p.adjust.method: "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none"
+
+ModulePlot <- function(module, gene.data, named.vector, idents, times, strains=c("flox", "LMcreflox"), limits=F, ymin, ymax, p.adjust.method="bonferroni"){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  CellPosition <- grepall(idents, allsamples)
+  TimesPosition <- grepall(times, allsamples)
+  StrainPosition <- grepall(strains, allsamples)
+  samples <- allsamples[Reduce(intersect, list(CellPosition,TimesPosition,StrainPosition))]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    data <- rbind(data, data.frame(Sample=samples[i], Expression=apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)))
+  }
+  data <- na.omit(data)
+  
+  return1 <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(idents) + geom_violin(scale="width") + scale_x_discrete(limits=samples,   label=unlist(lapply(strsplit(samples,"_"),head,n=1))) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x =element_blank(), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'), axis.text.x = element_text(size=12, angle = 45, hjust = 1))  + theme_classic() + if(limits){ylim(ymin,ymax)}else{}
+
+  return2 <- stats::pairwise.wilcox.test(x=data$Expression, g=data$Sample, paired=F, p.adjust.method=p.adjust.method)
+  
+  return(list(return1, return2))
+}
+
+# not using code: geom_jitter(shape=16, size=pt.size)
+```
+
+```{r}
+if(isallsame(names(MCAOall$timepoint),names(MCAOall$strain_final.celltype))) {
+  MCAOall$time_strain_final.celltype <- paste(MCAOall$timepoint, MCAOall$strain_final.celltype, sep="_")
+  names(MCAOall$time_strain_final.celltype) <- names(MCAOall$timepoint)
+}
+```
+
+```{r}
+ModulePlot(module=Inflagene_GSEA_toMs, 
+           gene.data=MCAOall@assays$RNA@data, 
+           named.vector=MCAOall$time_strain_final.celltype, 
+           idents="Neut", 
+           times=c("0h","1h","3h"), 
+           strains=c("flox", "LMcreflox"), 
+           limits=F, 
+           p.adjust.method="bonferroni")
+```
+

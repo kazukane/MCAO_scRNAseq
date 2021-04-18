@@ -1,0 +1,303 @@
+---
+title: "kkd2-8 MCAOarticle-revise, analysis using both flox and creflox samples"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+library(VennDiagram)
+
+# Install font for plot
+library(showtext)
+font_install(source_han_serif())
+showtext_auto()
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+# Parameters
+SampleIDs <- c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox")
+nSample <- length(SampleIDs)
+```
+
+# 1. Read in clustered MCAO data
+```{r}
+MCAOall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+```
+
+```{r}
+DimPlot(MCAOall) + theme(text=element_text(family="sans"))
+```
+
+```{r}
+MCAOall@meta.data %>% colnames()
+```
+
+
+# 2. Combine Ly6ChiMo and Ly6ChiMo_prolif
+```{r}
+MCAOall$final.celltype_forScoring = MCAOall$final.celltype %>% replace(grep("^Ly6ChiMo", MCAOall$final.celltype), "Ly6ChiMo_all")
+MCAOall$final.celltype_forScoring = MCAOall$final.celltype_forScoring %>% replace(grep("^Tcell", MCAOall$final.celltype), "Tcell_all")
+
+MCAOall$final.celltype_forScoring %>% unique
+
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+DimPlot(object = MCAOall, reduction = "umap",  order=rev(levels(Idents(MCAOall))), label=T, label.size=3) 
+```
+
+# 3. Heatmap of efferocytosis related genes (related to Fig.2B)
+
+## 3-1. Load gene expression data after several stimulation
+
+### Efferocytosis data
+GSE1197273
+Nature, 563:714, 2019. Efferocytosis induces a novel SLC program to promote glucose uptake and lactate release.
+
+```{r}
+# Efferocytosis data
+Efferocytosis.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/GSE119273_Phago+AC_bulkRNA/GSE119273_LR73_AC_padj-notNA.csv", header = T, stringsAsFactors = F)
+
+head(Efferocytosis.data, n=10)
+```
+
+## 3-2. Define UP and DOWN genes
+```{r}
+p_threshold <- 0.05
+
+# Efferocytosis
+## padj < 0.05, UP in Phago+AC & Exist in MCAO samples
+Effero.UP <- subset(Efferocytosis.data, Efferocytosis.data$padj <= p_threshold & Efferocytosis.data$log2FoldChange > 0)$gene
+Effero.UP <- intersect(rownames(MCAOall), Effero.UP)
+## padj < 0.05, DOWN in Phago+AC & Exist in MCAO samples
+Effero.DOWN <- subset(Efferocytosis.data, Efferocytosis.data$padj <= p_threshold & Efferocytosis.data$log2FoldChange < 0)$gene
+Effero.DOWN <- intersect(rownames(MCAOall), Effero.DOWN)
+```
+
+
+## 3-3. Common genes between Effero.UP genes and Ly6ChiMo-DEGs (KO vs WT at MCAO-1h)
+
+### Prepare parameters
+```{r}
+if (isallsame(names(MCAOall$strain), names(MCAOall$final.celltype_forScoring))) {
+  MCAOall$strain_final.celltype_forScoring <- paste(MCAOall$strain, MCAOall$final.celltype_forScoring, sep="_")
+} else { print("Order of vectors are not same") }
+
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$strain_final.celltype_forScoring))) {
+  MCAOall$timepoint_strain_final.celltype_forScoring <- paste(MCAOall$timepoint, MCAOall$strain_final.celltype_forScoring, sep="_")
+} else { print("Order of vectors are not same") }
+
+MCAOall$timepoint_strain_final.celltype_forScoring %>% unique()
+```
+
+### DEGs in Ly6ChiMo: KO vs WT (MCAO-1h)
+```{r}
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+Ly6ChiMo_1h_DEGs <- FindMarkers(MCAOall, ident.1 = "1h_LMcreflox_Ly6ChiMo_all", ident.2 = "1h_flox_Ly6ChiMo_all")
+Ly6ChiMo_1h_UPinKO <- Ly6ChiMo_1h_DEGs %>% rownames_to_column(var="Gene") %>% filter(p_val_adj<=0.05) %>% filter(avg_logFC>0) %>% pull(Gene)
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+
+Ly6ChiMo_1h_UPinKO
+```
+
+### Common genes of Effero.UP and Ly6ChiMo_1h_UPinKO
+```{r}
+intersect_genes <- intersect(Effero.UP, Ly6ChiMo_1h_UPinKO) 
+intersect_genes
+```
+
+### Heatmap
+```{r}
+# After PANTHER analysis of intersect_gene
+cellcyle_gene <- read.table("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/Intersected gene PANTHER/cellcycle.txt", header=F, sep="\t", quote = "", stringsAsFactors = F) %>% pull(V2)
+cytoskeleton_organization_gene <- read.table("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/Intersected gene PANTHER/cytoskeleton organization.txt", header=F, sep="\t", quote = "", stringsAsFactors = F) %>% pull(V2)
+```
+
+```{r}
+MCAOall$timepoint_strain_final.celltype_forScoring %>% unique
+```
+
+```{r}
+A <- setdiff(cellcyle_gene, intersect(cellcyle_gene, cytoskeleton_organization_gene))
+B <- intersect(cellcyle_gene, cytoskeleton_organization_gene)
+C <- setdiff(cytoskeleton_organization_gene, intersect(cellcyle_gene, cytoskeleton_organization_gene))
+D <- setdiff(intersect_genes, c(A,B,C))
+features <- c(A, B, C, D)
+rm(list=c("A","B","C","D"))
+
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+DoHeatmap(MCAOall, cells = WhichCells(MCAOall, idents = c("0h_flox_Ly6ChiMo_all","0h_LMcreflox_Ly6ChiMo_all","1h_flox_Ly6ChiMo_all","1h_LMcreflox_Ly6ChiMo_all","3h_flox_Ly6ChiMo_all","3h_LMcreflox_Ly6ChiMo_all")), features = features, draw.line=F) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(axis.text.y = element_text(size=15, face="plain"))
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+```
+
+
+## 3-4. Other upregulated genes after efferocytosis in the Nature paper
+
+Select from the Nature paper
+Nature, 563:714, 2019. Efferocytosis induces a novel SLC program to promote glucose uptake and lactate release.
+-> Select top 10 up-regulated genes in each category of Supplementary table 1
+
+### Select genes
+
+```{r}
+# Read in gene list
+SupTable1_EfferoUP <- read.csv("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/Nature-Morioka-2018/Nature-Morioka-2018_Partof-SupTable1_Effero-UPgenes.csv", header = T, stringsAsFactors = F)
+
+# Select genes that exist in MCAO dataset
+SupTable1_EfferoUP <- SupTable1_EfferoUP %>% filter(gene %in% rownames(MCAOall))
+SupTable1_EfferoUP
+```
+
+```{r}
+SupTable1_EfferoUP$category %>% unique()
+Effero_path <- c("Anti-infllamatory-associated genes","Actin rearrangement_Cell motility genes","ER Stress_UPR-associated genes","Glycolysis-associated genes","Calcium signaling-associated genes","Anti-apoptotic-associated genes")
+```
+
+```{r}
+Efferocytosis_FC <- Efferocytosis.data %>% select(gene, log2FoldChange)
+
+# Add after-efferocytosis-fold-change column
+SupTable1_EfferoUP <-dplyr::left_join(SupTable1_EfferoUP, Efferocytosis_FC, by="gene")
+SupTable1_EfferoUP
+```
+```{r}
+# Select top 10 genes
+SupTable1_EfferoUP_top <- data.frame(category=NA, gene=NA, log2FoldChange=NA)
+for(path in Effero_path){
+  table <- SupTable1_EfferoUP %>% filter(category==path) %>% arrange(desc(log2FoldChange)) %>% top_n(10, log2FoldChange)
+  SupTable1_EfferoUP_top <- rbind(SupTable1_EfferoUP_top, table)
+  rm(table)
+}
+SupTable1_EfferoUP_top <- na.omit(SupTable1_EfferoUP_top)
+SupTable1_EfferoUP_top
+```
+
+
+### Heatmap
+```{r}
+features <- SupTable1_EfferoUP_top$gene
+
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+DoHeatmap(MCAOall, cells = WhichCells(MCAOall, idents = c("0h_flox_Ly6ChiMo_all","0h_LMcreflox_Ly6ChiMo_all","1h_flox_Ly6ChiMo_all","1h_LMcreflox_Ly6ChiMo_all","3h_flox_Ly6ChiMo_all","3h_LMcreflox_Ly6ChiMo_all")), features = features, draw.line=F) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(axis.text.y = element_text(size=15, face="plain"))
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+```
+
+
+# 4. Heatmap of LPS-response genes and IFNg-response genes (related to Fig. S2A)
+
+## 4-1. Load gene expression data after several stimulation
+
+### LPS and IFNg data
+GSE44292
+J Leukoc Biol, 96:167, 2014. Analysis of the transcriptional networks underpinning the activation of murine macrophages by inflammatory mediators.
+
+```{r}
+# LPS data
+MP_LPS.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/MP-stim_transcriptome/GSE44292_MP/GSE44292_MP-LPS-4h.csv", header=T, stringsAsFactors = F)
+
+# IFNg data
+MP_Ifng.data <- read.csv("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_082319/MP-stim_transcriptome/GSE44292_MP/GSE44292_MP-Ifng-4h.csv", header=T, stringsAsFactors = F)
+```
+
+## 4-2. Define UP and DOWN genes based on each data
+```{r}
+p_threshold <- 0.05
+
+# LPS
+## padj < 0.05, UP after LPS & Exist in MCAO samples
+LPS.UP <- subset(MP_LPS.data, MP_LPS.data$adj.P.Val <= p_threshold & MP_LPS.data$logFC > 0)$Gene.symbol
+LPS.UP <- intersect(rownames(MCAOall), LPS.UP)
+## padj < 0.05, DOWN after LPS & Exist in MCAO samples
+LPS.DOWN <- subset(MP_LPS.data, MP_LPS.data$adj.P.Val <= p_threshold & MP_LPS.data$logFC < 0)$Gene.symbol
+LPS.DOWN <- intersect(rownames(MCAOall), LPS.DOWN)
+
+# Ifng
+## padj < 0.05, UP after LPS & Exist in MCAO samples
+Ifng.UP <- subset(MP_Ifng.data, MP_Ifng.data$adj.P.Val <= p_threshold & MP_Ifng.data$logFC > 0)$Gene.symbol
+Ifng.UP <- intersect(rownames(MCAOall), Ifng.UP)
+## padj < 0.05, DOWN after Ifng & Exist in MCAO samples
+Ifng.DOWN <- subset(MP_Ifng.data, MP_Ifng.data$adj.P.Val <= p_threshold & MP_Ifng.data$logFC < 0)$Gene.symbol
+Ifng.DOWN <- intersect(rownames(MCAOall), Ifng.DOWN)
+```
+
+## 4-3. Common genes of LPS.UP/Ifng.UP and Ly6ChiMo_1h_DOWNinKO
+```{r}
+Ly6ChiMo_1h_DOWNinKO <- Ly6ChiMo_1h_DEGs %>% rownames_to_column(var="Gene") %>% filter(p_val_adj<=0.05) %>% filter(avg_logFC<0) %>% arrange(avg_logFC) %>% pull(Gene)
+
+# LPS
+LPS_intersect_genes <- intersect(LPS.UP, Ly6ChiMo_1h_DOWNinKO) 
+LPS_intersect_genes
+
+# Ifng
+Ifng_intersect_genes <- intersect(Ifng.UP, Ly6ChiMo_1h_DOWNinKO) 
+Ifng_intersect_genes
+```
+
+## 4-4. Heatmap
+
+LPS
+```{r}
+features <- LPS_intersect_genes
+
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+DoHeatmap(MCAOall, cells = WhichCells(MCAOall, idents = c("0h_flox_Ly6ChiMo_all","0h_LMcreflox_Ly6ChiMo_all","1h_flox_Ly6ChiMo_all","1h_LMcreflox_Ly6ChiMo_all","3h_flox_Ly6ChiMo_all","3h_LMcreflox_Ly6ChiMo_all")), features = features, draw.line=F) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(axis.text.y = element_text(size=15, face="plain"))
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+```
+
+Ifng
+```{r}
+features <- Ifng_intersect_genes
+
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype_forScoring
+DoHeatmap(MCAOall, cells = WhichCells(MCAOall, idents = c("0h_flox_Ly6ChiMo_all","0h_LMcreflox_Ly6ChiMo_all","1h_flox_Ly6ChiMo_all","1h_LMcreflox_Ly6ChiMo_all","3h_flox_Ly6ChiMo_all","3h_LMcreflox_Ly6ChiMo_all")), features = features, draw.line=F) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(axis.text.y = element_text(size=15, face="plain"))
+Idents(MCAOall) <- MCAOall$final.celltype_forScoring
+```
+
+
+# 5. Inflammatory cytokine in Ly6chi monocytes (related to Fig.5DE and Fig.S5AB)
+
+-> Added to notebook kkd2-7, #7
+
+
+# 6. Whether CD36 is included in the efferocytosis-related genes
+```{r}
+SupTable1_EfferoUP$gene
+```
+
+```{r}
+is.element("Cd36", SupTable1_EfferoUP$gene)
+is.element("Cd36", Effero.UP)
+is.element("Cd36", Effero.DOWN)
+```
+
+```{r}
+levels(Idents(MCAOall))
+MCAOall$timepoint_strain_final.celltype_forScoring %>% unique()
+```
+
+
+```{r}
+VlnPlot(MCAOall, idents = "Ly6ChiMo_all", features = "Cd36", group.by = "timepoint_strain_final.celltype_forScoring")
+```
+
+

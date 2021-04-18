@@ -1,0 +1,195 @@
+---
+title: "kkd2-6 MCAOarticle, both flox and creflox, character of Ly6Chi_prolif"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+library(VennDiagram)
+library(clipr)
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+# Parameters
+SampleIDs <- c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox")
+nSample <- length(SampleIDs)
+```
+
+# 1. Read Seurat object
+```{r}
+MCAOall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+```
+
+# 2. Preparation of idents
+```{r}
+if (isallsame(names(MCAOall$strain), names(MCAOall$final.celltype))) {
+  MCAOall$strain_final.celltype <- paste(MCAOall$strain, MCAOall$final.celltype, sep="_")
+} else { print("Order of vectors are not same") }
+
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$strain))) {
+  MCAOall$timepoint_strain <- paste(MCAOall$timepoint, MCAOall$strain, sep="_")
+} else { print("Order of vectors are not same") }
+
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$final.celltype))) {
+  MCAOall$timepoint_final.celltype <- paste(MCAOall$timepoint, MCAOall$final.celltype, sep="_")
+} else { print("Order of vectors are not same") }
+
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$strain_final.celltype))) {
+  MCAOall$timepoint_strain_final.celltype <- paste(MCAOall$timepoint, MCAOall$strain_final.celltype, sep="_")
+} else { print("Order of vectors are not same") }
+
+MCAOall$timepoint_strain_final.celltype %>% unique()
+```
+
+# 3. DEGs related to Ly6ChiMo_prolif
+## Ly6ChiMo_prolif vs Ly6ChiMo  @MCAO1h
+```{r}
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype
+ident1 <- c("1h_LMcreflox_Ly6ChiMo_prolif","1h_flox_Ly6ChiMo_prolif")
+ident2 <- c("1h_LMcreflox_Ly6ChiMo","1h_flox_Ly6ChiMo")
+Ly6ChiMo_PvsNP_1h <- FindMarkers(MCAOall, ident.1 = ident1, ident.2 = ident2)
+Ly6ChiMo_PvsNP_1h <- Ly6ChiMo_PvsNP_1h %>% rownames_to_column(var="Gene")
+write.csv(Ly6ChiMo_PvsNP_1h, file="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/DEGs/Ly6ChiMo_PvsNP_1h.csv")
+Ly6ChiMo_PvsNP_1h
+```
+
+## Ly6ChiMo_prolif vs Other cell type  @MCAO1h
+```{r}
+MCAOall$timepoint_final.celltype %>% unique()
+Idents(MCAOall) <- MCAOall$timepoint_final.celltype
+ident1 <- c("1h_Ly6ChiMo_prolif")
+ident2 <- setdiff(unique(MCAOall$timepoint_final.celltype)[grep("1h", unique(MCAOall$timepoint_final.celltype))], "1h_Ly6ChiMo_prolif")
+Ly6ChiMo_PvsOthers_1h <- FindMarkers(MCAOall, ident.1 = ident1, ident.2 = ident2)
+Ly6ChiMo_PvsOthers_1h <- Ly6ChiMo_PvsOthers_1h %>% rownames_to_column(var="Gene")
+write.csv(Ly6ChiMo_PvsOthers_1h, file="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/DEGs/Ly6ChiMo_PvsOthers_1h.csv")
+Ly6ChiMo_PvsOthers_1h
+```
+
+
+
+# 4. GSEA analysis
+
+GSEA version: 4.0.1
+Ref paper: https://www.pnas.org/content/102/43/15545
+
+## 4-1. Select genes and save data for GSEA analysis
+```{r}
+Ly6ChiMo_PvsNP_1h_GSEA <- Ly6ChiMo_PvsNP_1h %>% filter(p_val_adj <= 0.1) %>% dplyr::select(Gene, avg_logFC)
+
+# For GSEA analysis, convert the fold change values to linear scale
+Ly6ChiMo_PvsNP_1h_GSEA <- data.frame(NAME=Ly6ChiMo_PvsNP_1h_GSEA$Gene, Description="na", Control=1, Target=exp(Ly6ChiMo_PvsNP_1h_GSEA$avg_logFC), stringsAsFactors = F)
+Ly6ChiMo_PvsNP_1h_GSEA
+
+write.csv(Ly6ChiMo_PvsNP_1h_GSEA, file="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/GSEA/Ly6ChiMo_PvsNP_1h_GSEA.csv")
+```
+
+## 4-2. ~  see dropbox paper
+
+
+# 5. Analysis of chemokine receptor expressions
+## 5-1. Generate gene list data
+
+## 5-2. Load the gene lists
+```{r}
+Chemokines_data <- read.csv("/Users/kazumasa/Desktop/Dry_analysis/Database/Chemokines_mouse.csv", header = T, stringsAsFactors = F)
+Chemokines_data
+Integrins_data <- read.csv("/Users/kazumasa/Desktop/Dry_analysis/Database/Integrins_mouse.csv", header = T, stringsAsFactors = F)
+Integrins_data
+```
+
+```{r}
+# Extract the gene lists 
+ChemokineR <- Chemokines_data$Receptor_mouse_gene %>% unique()
+ChemokineR
+```
+
+```{r}
+# Extract the gene lists 
+Integrins <- Integrins_data$Mouse_gene %>% unique()
+Integrins
+```
+
+
+## 5-3. Extract the common genes with DEGs
+"ChemokineR" and "Ly6ChiMo_PvsNP_1h"
+```{r}
+Ly6ChiMo_PvsNP_1h %>% filter(Gene %in% ChemokineR)
+```
+
+"ChemokineR" and "Ly6ChiMo_PvsOthers_1h"
+```{r}
+Ly6ChiMo_PvsOthers_1h %>% filter(Gene %in% ChemokineR)
+```
+
+"Integrins" and "Ly6ChiMo_PvsNP_1h"
+```{r}
+Ly6ChiMo_PvsNP_1h %>% filter(Gene %in% Integrins)
+```
+
+"Integrins" and "Ly6ChiMo_PvsOthers_1h"
+```{r}
+Ly6ChiMo_PvsOthers_1h %>% filter(Gene %in% Integrins)
+```
+
+
+# 6. About Cxcr4
+## 6-1. Cxcr4 expression in each cell type
+```{r}
+Idents(MCAOall) <- MCAOall$final.celltype
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Tcell_prolif","Bcell","NK","Others","Others_prolif")
+
+VlnPlot(MCAOall, features = "Cxcr4", pt.size = 0) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank()) + scale_x_discrete(limits=order)
+```
+
+```{r}
+VlnPlot(MCAOall, features = "Cxcl12", pt.size = 0) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank()) + scale_x_discrete(limits=order)
+```
+
+```{r}
+VlnPlot(MCAOall, features = "Ccr2", pt.size = 0) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank()) + scale_x_discrete(limits=order)
+```
+
+## 6-2. Cxcr4 expression in Ly6ChiMo_prolif of flox/cre-flox
+```{r}
+VlnPlot(MCAOall, idents = "Ly6ChiMo_prolif", features = "Cxcr4", group.by = "timepoint_strain", pt.size=0.2, slot="data", cols=c("white","grey","white","grey","white","grey")) + ylab("Expression") + stat_summary(fun.y = mean, geom='point', size = 10, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank())
+```
+
+
+
+
+---------------------------------------------
+
+
+```{r}
+Idents(MCAOall) <- MCAOall$final.celltype
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Tcell_prolif","Bcell","NK","Others","Others_prolif")
+
+VlnPlot(MCAOall, features = "Hmgb1", pt.size = 0) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x = element_blank()) + scale_x_discrete(limits=order)
+```
+
+
+```{r}
+FeaturePlot(MCAOall, features = "Hmgb1", max.cutoff = "q70")
+```

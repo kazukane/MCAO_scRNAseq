@@ -1,0 +1,190 @@
+---
+title: "kkd2-2 MCAOarticle, both flox and creflox samples, microglia phenotype"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+library(VennDiagram)
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+## Gene name: HUMAN to Mouse pattern
+HUtoMSpattern <- function(x) { paste0(stringr::str_sub(x,1,1), tolower(stringr::str_sub(x,2,-1))) }
+
+# Parameters
+SampleIDs <- c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox")
+nSample <- length(SampleIDs)
+```
+
+# 1. Load Seurat data and subset microglia data
+```{r}
+MCAOall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+
+# Subset microglia data
+MGall <- subset(MCAOall, idents = "Microglia")
+```
+
+```{r}
+saveRDS(MGall, file="/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MGall_012220.rds")
+```
+
+```{r}
+MGall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MGall_012220.rds")
+```
+
+
+# 2. Re-cluster microglia
+```{r}
+# [Identification of highly variable features (feature selection)]
+MGall <- FindVariableFeatures(object = MGall, selection.method = "vst", nfeatures = 2000)
+
+# [Scaling the data] =Z-score??
+MGall <- ScaleData(object = MGall, features=rownames(MGall))
+
+# [Perform linear dimensional reduction]
+MGall <- RunPCA(object = MGall, features = VariableFeatures(object = MGall))
+
+# Examine and visualize PCA results a few different ways
+DimPlot(object = MGall, reduction = "pca", group.by = "stim")
+ElbowPlot(object = MGall)
+
+# [Cluster the cells]
+MGall <- FindNeighbors(object = MGall, dims = 1:20)
+MGall <- FindClusters(object = MGall, resolution = 0.2)
+MGall <- RunUMAP(object = MGall, dims = 1:20)
+
+# Visualize UMAP data
+DimPlot(object = MGall, reduction = "umap",  order=rev(levels(Idents(MGall))), label=T, label.size=7)
+DimPlot(object = MGall, reduction = "umap",  order=rev(levels(Idents(MGall))), label=T, label.size=5, group.by = "timepoint")
+FeaturePlot(object = MGall, features = c("Jdp2"), cols = c("lightgrey", "red"))
+```
+
+
+# 2. DEGs of MCAO-3h vs Naive
+```{r}
+# Prepare parameter
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$final.celltype))) {
+  MCAOall$timepoint_final.celltype <- paste(MCAOall$timepoint, MCAOall$final.celltype, sep="_")
+} else { print("Order of vectors are not same") }
+
+# DEGs of MCAO-3h vs Naive
+Idents(MCAOall) <- MCAOall$timepoint_final.celltype
+Microglia_DEGs_3HvsNaive <- FindMarkers(MCAOall, ident.1 = "3h_Microglia", ident.2 = "0h_Microglia") 
+Microglia_DEGs_3HvsNaive <- Microglia_DEGs_3HvsNaive %>% rownames_to_column(var = "Gene")
+Idents(MCAOall) <- MCAOall$final.celltype
+```
+
+
+# 3.  GO enrichment analysis of UP genes in Microglia-3h
+### Obtain UP genes
+```{r}
+Microglia_UPin3H <- Microglia_DEGs_3HvsNaive %>% filter(avg_logFC>0 & p_val_adj<0.05) %>% pull(Gene)
+clipr::write_clip(Microglia_UPin3H)
+```
+
+### Analysis after GO enrichment analysis (DAVID_GO-BP)
+```{r}
+MG_3hUP_GOBP <- read.table("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/MG_3hUP-DEGs_DAVID-GOBP.txt", header=T, sep="\t", quote = "", stringsAsFactors = F)
+head(MG_3hUP_GOBP, n=10)
+```
+
+### Select GO terms
+```{r}
+MG_3hUP_GOBP_selected <- MG_3hUP_GOBP %>% filter(FDR<=0.05) %>% arrange(desc(Count))
+#not using code: %>% top_n(n = 10, wt = Count)
+
+write.csv(MG_3hUP_GOBP_selected, file="/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/MG_3hUP_GOBP_selected.csv")
+MG_3hUP_GOBP_selected
+```
+
+### Inflammatory genes up-regulated in MG of MCAO-3h
+```{r}
+MG_DEGs_infla <- MG_3hUP_GOBP %>% filter(Term=="GO:0006954~inflammatory response") %>% pull(Genes) %>% strsplit(", ") %>% unlist() %>% HUtoMSpattern()
+
+# Re-order genes based on the value of "avg_log_FC" in DEG data
+Microglia_DEGs_3HvsNaive.infla <- Microglia_DEGs_3HvsNaive %>% filter(Gene %in% MG_DEGs_infla) %>% arrange(desc(avg_logFC))
+MG_DEGs_infla <- Microglia_DEGs_3HvsNaive.infla %>% pull(Gene)
+MG_DEGs_infla
+```
+
+# 4. Visualization of inflammatory response genes
+### Heatmap
+```{r}
+# Prepare parameter
+if (isallsame(names(MCAOall$timepoint), names(MCAOall$strain_final.celltype))) {
+  MCAOall$timepoint_strain_final.celltype <- paste(MCAOall$timepoint, MCAOall$strain_final.celltype, sep="_")
+} else { print("Order of vectors are not same") }
+
+# Heatmap
+Idents(MCAOall) <- MCAOall$timepoint_strain_final.celltype
+DoHeatmap(MCAOall, cells=WhichCells(MCAOall, idents = c("0h_flox_Microglia","0h_LMcreflox_Microglia","1h_flox_Microglia","1h_LMcreflox_Microglia","3h_flox_Microglia","3h_LMcreflox_Microglia")), features = MG_DEGs_infla, draw.line = FALSE) + NoLegend() + scale_fill_gradientn(colors = c("skyblue","white","red")) + theme(legend.position="none", axis.title.y =element_blank())
+Idents(MCAOall) <- MCAOall$final.celltype
+```
+
+## Violin plot of inflammatory genes in microglia
+### Preparation of "ModulePlot" function
+```{r}
+# idents: Select from "levels(MCAOall@active.ident)"
+# times: Select from "0h","1h","3h"
+# strains: select from "flox", "LMcreflox"
+# p.adjust.method: "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none"
+
+ModulePlot <- function(module, gene.data, named.vector, idents, times, strains=c("flox", "LMcreflox"), limits=F, ymin, ymax, p.adjust.method="bonferroni"){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  CellPosition <- grepall(idents, allsamples)
+  TimesPosition <- grepall(times, allsamples)
+  StrainPosition <- grepall(strains, allsamples)
+  samples <- allsamples[Reduce(intersect, list(CellPosition,TimesPosition,StrainPosition))]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    data <- rbind(data, data.frame(Sample=samples[i], Expression=apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)))
+  }
+  data <- na.omit(data)
+  
+  return1 <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(idents) + geom_violin(scale="width") + scale_x_discrete(limits=samples,   label=unlist(lapply(strsplit(samples,"_"),head,n=1))) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x =element_blank(), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'), axis.text.x = element_text(size=12, angle = 45, hjust = 1))  + theme_classic() + if(limits){ylim(ymin,ymax)}else{}
+
+  return2 <- stats::pairwise.wilcox.test(x=data$Expression, g=data$Sample, paired=F, p.adjust.method=p.adjust.method)
+  
+  return(list(return1, return2))
+}
+
+# not using code: geom_jitter(shape=16, size=pt.size)
+```
+
+Compare inflammatory gene of flox-microglia vs creflox-microglia 
+```{r}
+# idents: Select from "levels(MCAOall@active.ident)"
+# times: Select from "N","MO1h","MO3h"
+# strains: select from "flox", "LMcreflox", default: c("flox", "LMcreflox")
+ModulePlot(module=MG_DEGs_infla, gene.data=MCAOall@assays$RNA@scale.data, named.vector=MCAOall$timepoint_strain_final.celltype, idents="Microglia", times=c("0h","1h","3h"), limits=F, ymin=-0.5, ymax=2)
+```

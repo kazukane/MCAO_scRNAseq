@@ -1,0 +1,97 @@
+---
+title: "kkd2-5 MCAOarticle, both flox and creflox, clusters in each sample (timepoint_genotype), cell proportions"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+library(VennDiagram)
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+# Parameters
+SampleIDs <- c("N.flox","N.LMcreflox","MO1h.flox","MO1h.LMcreflox","MO3h.flox","MO3h.LMcreflox")
+nSample <- length(SampleIDs)
+```
+
+# 1. Read Seurat object
+```{r}
+MCAOall <- readRDS("/Users/kazumasa/Desktop/Single cell RNAseq/Work_oriData/MCAOall_121819/MCAOall_121819_finalcelltype.rds")
+```
+
+
+# 2. Visualize each sample
+All
+```{r}
+order <- c("Microglia","MP","DC","Ly6ChiMo","Ly6ChiMo_prolif","resMo","Neut","Tcell","Tcell_prolif","Bcell","NK","Others","Others_prolif")
+DimPlot(MCAOall, reduction = "umap", order = rev(order))
+```
+
+N.flox
+```{r}
+DimPlot(MCAOall, reduction = "umap", cells = names(MCAOall$stim)[which(MCAOall$stim=="N.flox")], order = rev(order))
+```
+
+N.LMcreflox
+```{r}
+DimPlot(MCAOall, reduction = "umap", cells = names(MCAOall$stim)[which(MCAOall$stim=="N.LMcreflox")], order = rev(order))
+```
+
+MO1h.flox
+```{r}
+DimPlot(MCAOall, reduction = "umap", cells = names(MCAOall$stim)[which(MCAOall$stim=="MO1h.flox")], order = rev(order))
+```
+
+MO1h.LMcreflox
+```{r}
+DimPlot(MCAOall, reduction = "umap", cells = names(MCAOall$stim)[which(MCAOall$stim=="MO1h.LMcreflox")], order = rev(order))
+```
+
+MO3h.flox
+```{r}
+DimPlot(MCAOall, reduction = "umap", cells = names(MCAOall$stim)[which(MCAOall$stim=="MO3h.flox")], order = rev(order))
+```
+
+MO3h.LMcreflox
+```{r}
+DimPlot(MCAOall, reduction = "umap", cells = names(MCAOall$stim)[which(MCAOall$stim=="MO3h.LMcreflox")], order = rev(order))
+```
+
+
+# 2. Cell number and proportion in each cluster of each sample
+```{r}
+Propor.list <- list()
+
+if (all((names(MCAOall$final.celltype)==names(MCAOall$stim))==TRUE)) {
+  for (i in 1:nSample) {
+  Propor.list[[i]] <- 100*(prop.table(table(MCAOall$final.celltype[grep(SampleIDs[i], MCAOall$stim)])))
+  names(Propor.list)[i] <- SampleIDs[i]
+  }
+} else { print("ERROR: order of Celltype.vec and Sample.vec is not same")}
+
+Propor.list
+write.csv(do.call(cbind, Propor.list), "Propor.csv")
+```
+

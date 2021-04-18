@@ -1,0 +1,141 @@
+---
+title: "kkd#2-4 MCAOarticle, only-flox, rationale of focusing on Cd300a"
+output: html_notebook
+---
+
+# 0. Load libraries, basic own functions, and required parameters
+```{r}
+# Load libraries
+library(Seurat)
+library(DoubletFinder)
+library(ggplot2)
+library(tidyverse)
+library(gtable)
+library(grid)
+library(ggstatsplot)
+library(progress)
+library(gridExtra)
+
+# Basic own functions
+## is all same
+isallsame <- function(x, y) { all((x==y)==TRUE) }
+
+## grep for all
+grepall <- function(x, y) { unlist(lapply(x,grep,y)) }
+
+## which for all
+whichall <- function(x,y) {
+  Out <- c()
+  for(i in seq_along(x)) { Out <- c(Out, which(y==x[i])) }
+  Out
+}
+
+## Gene name: HUMAN to Mouse pattern
+HUtoMSpattern <- function(x) { paste0(stringr::str_sub(x,1,1), tolower(stringr::str_sub(x,2,-1))) }
+
+# Parameters
+SampleIDsForDataLoading <- c("N.flox","MO1h.flox","MO3h.flox")
+SampleIDs <- c("Naive","MCAO1h","MCAO3h")
+nSample <- length(SampleIDs)
+```
+
+# 1. Load MCAOflox seurat data
+```{r}
+MCAOflox <- readRDS("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/MCAOflox_021520.rds")
+```
+
+# 2. PS receptors
+Reference: https://www.nature.com/articles/ni.3253
+Phagocytosis of apoptotic cells in homeostasis (Nature Immunology, 2015)
+
+```{r}
+PSrecep_table <- read.csv("/Users/kazumasa/Desktop/Dry_analysis/kkd2_MCAOanalysis_forArticle/PSreceptors.csv", header = T, stringsAsFactors = F)
+PSrecep_table
+```
+
+```{r}
+PSrecep <- PSrecep_table %>% pull(Gene) %>% unique()
+PSrecep
+```
+
+
+# 3. Expression of PS receptors in myeloid cells
+
+```{r}
+# DEGs in each cell type (same as kkd2-1-#7)
+# Prepare $time_fCelltype and vector:fCelltypes
+if (isallsame(names(MCAOflox$stim), names(MCAOflox$final.celltype))) {
+  MCAOflox$time_fCelltype <- paste(MCAOflox$stim, MCAOflox$final.celltype, sep = "_")
+}
+fCelltypes <- c("Microglia","MP","DC","Ly6ChiMo","Ly6CloMo","Neut","Tcell","Bcell","NK","ILC","Prolif")
+
+# DEGs of 3H
+Idents(MCAOflox) <- MCAOflox$time_fCelltype
+DEG_3HvsN.list <- vector("list", length=length(fCelltypes))
+for (i in seq_along(fCelltypes)) {
+  DEG_3HvsN.list[[i]] <- FindMarkers(MCAOflox, ident.1 = paste("MCAO3h",fCelltypes[i],sep = "_"), ident.2 = paste("Naive",fCelltypes[i],sep = "_"))
+  names(DEG_3HvsN.list)[i] <- fCelltypes[i]
+}
+Idents(MCAOflox) <- MCAOflox$final.celltype
+
+x_order <- DEG_3HvsN.list %>% lapply(function(x){ nrow(filter(x, p_val_adj < 0.05)) }) %>% unlist() %>% sort(decreasing=T) %>% names()
+```
+
+Plotting and save to PDF file
+```{r}
+plot.list <- list()
+for (i in seq_along(PSrecep)) {
+  plot.list[[i]] <- VlnPlot(MCAOflox, features = PSrecep[i], group.by = "final.celltype", pt.size = 0, cols=rep("grey",length=11), ) + scale_x_discrete(limits=x_order) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position = "none", axis.title = element_blank())
+}
+
+ggsave(file="PSreceptor_exp.pdf", do.call(gridExtra::grid.arrange, c(plot.list, nrow = 3)), height = 12, width = 20)
+```
+
+
+
+
+
+
+
+------------
+
+```{r}
+ModulePlot <- function(module, gene.data, named.vector, idents, times, strains=c("flox", "LMcreflox"), limits=F, ymin, ymax, p.adjust.method="bonferroni"){
+  # Select sample names
+  allsamples <- unique(named.vector)
+  CellPosition <- grepall(idents, allsamples)
+  TimesPosition <- grepall(times, allsamples)
+  StrainPosition <- grepall(strains, allsamples)
+  samples <- allsamples[Reduce(intersect, list(CellPosition,TimesPosition,StrainPosition))]
+  
+  # Extract module gene data
+  if (isallsame(names(named.vector),colnames(gene.data))) { 
+    colnames(gene.data) <- named.vector 
+   } else { print("ERROR: orders of cellIDs are not same")}
+  
+  data <- data.frame(Sample=NA, Expression=NA, stringsAsFactors = F)
+  for (i in seq_along(samples)) {
+    data <- rbind(data, data.frame(Sample=samples[i], Expression=apply(gene.data[module,which(colnames(gene.data)==samples[i])], MARGIN = 2, mean)))
+  }
+  data <- na.omit(data)
+  
+  return1 <- ggplot(data, aes(x=Sample, y=Expression)) + ggtitle(idents) + geom_violin(scale="width") + scale_x_discrete(limits=samples,   label=unlist(lapply(strsplit(samples,"_"),head,n=1))) + stat_summary(fun.y = mean, geom='point', size = 15, colour = "black", shape=95) + theme(legend.position="none", axis.title.x =element_blank(), title =element_text(size=13, face='bold'), axis.title.y = element_text(size=12, face='plain'), axis.text.x = element_text(size=12, angle = 45, hjust = 1))  + theme_classic() + if(limits){ylim(ymin,ymax)}else{}
+
+  return2 <- stats::pairwise.wilcox.test(x=data$Expression, g=data$Sample, paired=F, p.adjust.method=p.adjust.method)
+  
+  return(list(return1, return2))
+}
+```
+
+
+```{r}
+# idents: Select from "levels(MCAOall@active.ident)"
+# times: Select from "N","MO1h","MO3h"
+# strains: select from "flox", "LMcreflox", default: c("flox", "LMcreflox")
+ModulePlot(module="Lyz2", gene.data=MCAOflox@assays$RNA@scale.data, named.vector=MCAOall$timepoint_strain_final.celltype, idents="Microglia", times=c("0h","1h","3h"), limits=F, ymin=-0.5, ymax=2)
+```
+
+
+
+
+
